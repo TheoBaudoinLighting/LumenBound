@@ -1,13 +1,13 @@
 cff-version: 1.2.0
 message: >-
-  Cite this software using this metadata after the repository owner completes
-  the author information.
+  If you use LumenBound in research, cite the software using this metadata.
 type: software
 title: LumenBound
 abstract: >-
   A deterministic, hierarchical spectral light-transport solver designed to
   produce conservative residual bounds instead of Monte Carlo noise.
 authors:
-  - name: Author information to be completed by the repository owner
+  - family-names: Baudoin Malnoë
+    given-names: Théo
 repository-code: https://github.com/TheoBaudoinLighting/LumenBound
 license: Apache-2.0
