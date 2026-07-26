@@ -1,0 +1,35 @@
+# CMake build trees and generated metadata.
+/build/
+/out/
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+compile_commands.json
+Makefile
+
+# User-specific CMake and IDE state.
+CMakeUserPresets.json
+/.vs/
+/.vscode/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Compiler and linker outputs.
+*.a
+*.dll
+*.dylib
+*.exe
+*.lib
+*.obj
+*.o
+*.pdb
+*.so
+
+# Test logs and platform metadata.
+Testing/
+*.log
+.DS_Store
+Thumbs.db

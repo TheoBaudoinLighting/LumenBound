@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.compiler.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - name: GCC
+            cc: gcc
+            cxx: g++
+          - name: Clang
+            cc: clang
+            cxx: clang++
+
+    env:
+      CC: ${{ matrix.compiler.cc }}
+      CXX: ${{ matrix.compiler.cxx }}
+      CMAKE_GENERATOR: Unix Makefiles
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure development build
+        run: cmake --preset dev
+
+      - name: Build development configuration
+        run: cmake --build --preset dev --parallel 2
+
+      - name: Test development configuration
+        run: ctest --preset dev --output-on-failure
+
+      - name: Configure release build
+        run: cmake --preset release
+
+      - name: Build release configuration
+        run: cmake --build --preset release --parallel 2
+
+      - name: Test release configuration
+        run: ctest --preset release --output-on-failure

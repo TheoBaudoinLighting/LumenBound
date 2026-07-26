@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: >-
+  Cite this software using this metadata after the repository owner completes
+  the author information.
+type: software
+title: LumenBound
+abstract: >-
+  A deterministic, hierarchical spectral light-transport solver designed to
+  produce conservative residual bounds instead of Monte Carlo noise.
+authors:
+  - name: Author information to be completed by the repository owner
+repository-code: https://github.com/TheoBaudoinLighting/LumenBound
+license: Apache-2.0
