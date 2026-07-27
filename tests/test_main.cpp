@@ -1,5 +1,7 @@
 #include "lumenbound/certification/certifier.hpp"
 #include "lumenbound/certification/image_metrics.hpp"
+#include "lumenbound/certification/problem_digest.hpp"
+#include "lumenbound/core/cornell_box_demo.hpp"
 #include "lumenbound/core/demo.hpp"
 #include "lumenbound/io/output.hpp"
 #include "lumenbound/math/dense_matrix.hpp"
@@ -8,8 +10,8 @@
 #include "lumenbound/math/rounding.hpp"
 #include "lumenbound/projection/projection.hpp"
 #include "lumenbound/solver/candidate_solver.hpp"
-#include "lumenbound/spectrum/spectrum.hpp"
 #include "lumenbound/transport/transport_system.hpp"
+#include "lumenbound/transport/diffuse_patch_assembly.hpp"
 
 #include <algorithm>
 #include <array>
@@ -74,12 +76,57 @@ void require_contains_long_double(const lumenbound::Interval& interval,
     require(lower <= value && value <= upper, message);
 }
 
-void require_status(const lumenbound::CertificationResult& result,
-                    lumenbound::CertificateStatus expected,
+void require_problem_digest(const lumenbound::Certificate& certificate,
+                            std::string_view message) {
+    require(certificate.problem_digest.starts_with("sha256:") &&
+                certificate.problem_digest.size() == 71U,
+            message);
+    for (std::size_t index = 7;
+         index < certificate.problem_digest.size(); ++index) {
+        const char digit = certificate.problem_digest[index];
+        require((digit >= '0' && digit <= '9') ||
+                    (digit >= 'a' && digit <= 'f'),
+                "a problem digest contains a non-canonical hex digit");
+    }
+}
+
+void require_proof(
+    const lumenbound::CertificationResult& result,
+    lumenbound::ProofStatus expected_status,
+    lumenbound::ProofFailureCode expected_failure,
+    std::string_view message) {
+    require(result.certificate.proof_status == expected_status, message);
+    require(result.certificate.proof_failure == expected_failure, message);
+    require(!result.certificate.proof_reason.empty(),
+            "a proof result must include a reason");
+    require_problem_digest(
+        result.certificate,
+        "a proof result must identify the supplied finite problem");
+}
+
+void require_target(const lumenbound::CertificationResult& result,
+                    lumenbound::TargetStatus expected,
                     std::string_view message) {
-    require(result.certificate.status == expected, message);
-    require(!result.certificate.reason.empty(),
-            "an uncertified result must include a reason");
+    require(result.certificate.target_status == expected, message);
+    require(!result.certificate.target_reason.empty(),
+            "a target result must include a reason");
+}
+
+void require_certified_bounds(const lumenbound::Certificate& certificate) {
+    require(!certificate.coefficient_bounds.empty(),
+            "a certified proof omitted coefficient bounds");
+    require(!certificate.pixel_bounds.empty(),
+            "a certified proof omitted pixel bounds");
+    for (const lumenbound::BoundedValue& bound :
+         certificate.coefficient_bounds) {
+        require(bound.proof_status == lumenbound::ProofStatus::Certified,
+                "a coefficient bound did not retain certified proof status");
+    }
+    for (const lumenbound::BoundedValue& bound :
+         certificate.pixel_bounds) {
+        require(bound.proof_status == lumenbound::ProofStatus::Certified,
+                "a pixel bound did not retain certified proof status");
+    }
 }
 
 [[nodiscard]] lumenbound::TransportSystem make_scalar_system(
@@ -110,6 +157,43 @@ void require_status(const lumenbound::CertificationResult& result,
     return *found;
 }
 
+void require_exact_coefficients_enclosed(
+    const lumenbound::ManufacturedProblem& problem,
+    const lumenbound::CertificationResult& result) {
+    for (std::size_t band = 0;
+         band < problem.exact_coefficients.size(); ++band) {
+        for (std::size_t coefficient = 0;
+             coefficient < problem.exact_coefficients[band].size();
+             ++coefficient) {
+            const lumenbound::BoundedValue& bound =
+                find_bound(result.certificate.coefficient_bounds,
+                           band, coefficient);
+            const double exact =
+                problem.exact_coefficients[band][coefficient];
+            require(bound.lower <= exact && exact <= bound.upper,
+                    "a coefficient enclosure excluded the exact solution");
+        }
+    }
+}
+
+void require_bound_vectors_equal(
+    const std::vector<lumenbound::BoundedValue>& first,
+    const std::vector<lumenbound::BoundedValue>& second,
+    std::string_view message) {
+    require(first.size() == second.size(), message);
+    for (std::size_t index = 0; index < first.size(); ++index) {
+        require(first[index].band == second[index].band &&
+                    first[index].index == second[index].index &&
+                    first[index].candidate == second[index].candidate &&
+                    first[index].lower == second[index].lower &&
+                    first[index].upper == second[index].upper &&
+                    first[index].error_bound == second[index].error_bound &&
+                    first[index].proof_status ==
+                        second[index].proof_status,
+                message);
+    }
+}
+
 [[nodiscard]] double maximum_snapshot_width(
     const lumenbound::IterationSnapshot& snapshot) {
     require(snapshot.lower.size() == snapshot.upper.size(),
@@ -133,7 +217,9 @@ void require_status(const lumenbound::CertificationResult& result,
 [[nodiscard]] std::string read_binary_file(
     const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
-    require(static_cast<bool>(stream), "expected output file is missing");
+    if (!stream) {
+        fail("expected output file is missing: " + path.string());
+    }
     return std::string(std::istreambuf_iterator<char>(stream),
                        std::istreambuf_iterator<char>());
 }
@@ -353,7 +439,7 @@ void test_rounding_mode_is_preserved() {
             "failed certified arithmetic changed the caller rounding mode");
 }
 
-void test_dense_algebra_and_spectrum_order() {
+void test_dense_algebra() {
     const lumenbound::DenseMatrix matrix(
         2, 3, {1.0, -2.0, 3.0, -0.5, 0.25, -0.125});
     require(matrix.infinity_norm() == 6.0,
@@ -369,19 +455,6 @@ void test_dense_algebra_and_spectrum_order() {
     const lumenbound::DenseVector product = matrix.multiply(vector);
     require(product[0] == -20.0 && product[1] == 2.25,
             "row-major matrix-vector multiplication is incorrect");
-
-    const lumenbound::Spectrum<3> first{0.25, 0.5, 0.75};
-    const lumenbound::Spectrum<3> second{1.0, 2.0, 3.0};
-    const lumenbound::Spectrum<3> combined = first + (second * 0.5);
-    require(combined.size() == 3 && combined[0] == 0.75 &&
-                combined[1] == 1.5 && combined[2] == 2.25,
-            "spectrum arithmetic changed coefficient order");
-    require_throws<std::invalid_argument>(
-        []() {
-            static_cast<void>(
-                lumenbound::Spectrum<3>{1.0, 2.0});
-        },
-        "spectrum accepted an incorrect coefficient count");
 }
 
 void test_candidate_solver_matches_manufactured_solution() {
@@ -405,7 +478,7 @@ void test_candidate_solver_matches_manufactured_solution() {
     }
     require(candidate.minimum_absolute_pivot > 0.0,
             "candidate solve did not report a positive pivot diagnostic");
-    require(candidate.nearest_residual_infinity_norm <= candidate_tolerance,
+    require(candidate.residual_infinity_norm <= candidate_tolerance,
             "candidate residual exceeded its binary64 test tolerance");
 }
 
@@ -415,11 +488,13 @@ void test_iteration_snapshots_are_monotone_and_contain_exact_solution() {
     const lumenbound::CertificationResult result =
         lumenbound::certify(
             problem.system, problem.projection,
-            lumenbound::CertificationOptions{1.0, 80.0, 512});
+            lumenbound::CertificationOptions{1.0, 1000.0, 512, true});
 
-    require(result.certificate.status ==
-                lumenbound::CertificateStatus::Certified,
-            "the manufactured system was not certified");
+    require_proof(result, lumenbound::ProofStatus::Certified,
+                  lumenbound::ProofFailureCode::None,
+                  "the manufactured system was not certified");
+    require_target(result, lumenbound::TargetStatus::Stagnated,
+                   "the snapshot run did not reach arithmetic stagnation");
     require(!result.iterations.empty(),
             "certification did not retain its interval snapshots");
     require(result.iterations.size() ==
@@ -470,7 +545,7 @@ void test_iteration_width_contracts() {
     const lumenbound::CertificationResult result =
         lumenbound::certify(
             problem.system, problem.projection,
-            lumenbound::CertificationOptions{1.0, 80.0, 512});
+            lumenbound::CertificationOptions{1.0, 1000.0, 512, true});
     require(result.iterations.size() > 1,
             "the manufactured enclosure did not perform an update");
 
@@ -538,6 +613,228 @@ void test_residual_certificate_contains_measured_errors() {
                 *result.certificate.candidate_error_upper_bound) >=
                 maximum_candidate_error,
             "residual certificate excluded the measured candidate error");
+
+    const double residual_error_bound =
+        *result.certificate.candidate_error_upper_bound;
+    for (std::size_t band = 0;
+         band < problem.exact_coefficients.size(); ++band) {
+        for (std::size_t coefficient = 0;
+             coefficient < problem.exact_coefficients[band].size();
+             ++coefficient) {
+            const lumenbound::BoundedValue& bound =
+                find_bound(result.certificate.coefficient_bounds,
+                           band, coefficient);
+            const double candidate =
+                result.candidate.values[band][coefficient];
+            const double residual_lower =
+                lumenbound::math::subtract_down(
+                    candidate, residual_error_bound);
+            const double residual_upper =
+                lumenbound::math::add_up(
+                    candidate, residual_error_bound);
+            require(bound.lower >= residual_lower &&
+                        bound.upper <= residual_upper,
+                    "the final enclosure escaped the residual enclosure");
+            const double exact =
+                problem.exact_coefficients[band][coefficient];
+            require(bound.lower <= exact && exact <= bound.upper,
+                    "the residual-refined enclosure excluded the exact value");
+        }
+    }
+}
+
+void test_target_outcomes_preserve_certified_proof() {
+    const lumenbound::ManufacturedProblem problem =
+        lumenbound::make_certified_patches_problem();
+
+    const lumenbound::CertificationResult reached =
+        lumenbound::certify(
+            problem.system, problem.projection,
+            lumenbound::CertificationOptions{1.0, 80.0, 512});
+    require_proof(reached, lumenbound::ProofStatus::Certified,
+                  lumenbound::ProofFailureCode::None,
+                  "the reachable target lost its certified proof");
+    require_target(reached, lumenbound::TargetStatus::Reached,
+                   "the 80 dB target was not reached");
+    require(reached.certificate.interval_iteration_count == 0U,
+            "the residual enclosure did not reach 80 dB at initialization");
+    require_certified_bounds(reached.certificate);
+    require_exact_coefficients_enclosed(problem, reached);
+
+    const lumenbound::CertificationResult limited =
+        lumenbound::certify(
+            problem.system, problem.projection,
+            lumenbound::CertificationOptions{1.0, 1000.0, 0});
+    require_proof(limited, lumenbound::ProofStatus::Certified,
+                  lumenbound::ProofFailureCode::None,
+                  "the iteration limit invalidated an established proof");
+    require_target(limited, lumenbound::TargetStatus::IterationLimit,
+                   "a zero iteration budget received the wrong target status");
+    require_certified_bounds(limited.certificate);
+    require_exact_coefficients_enclosed(problem, limited);
+
+    const lumenbound::CertificationResult stagnated =
+        lumenbound::certify(
+            problem.system, problem.projection,
+            lumenbound::CertificationOptions{1.0, 1000.0, 512});
+    require_proof(stagnated, lumenbound::ProofStatus::Certified,
+                  lumenbound::ProofFailureCode::None,
+                  "arithmetic stagnation invalidated an established proof");
+    require_target(stagnated, lumenbound::TargetStatus::Stagnated,
+                   "the unreachable target did not report stagnation");
+    require_certified_bounds(stagnated.certificate);
+    require_exact_coefficients_enclosed(problem, stagnated);
+}
+
+void test_iteration_snapshots_are_opt_in_and_proof_neutral() {
+    const lumenbound::ManufacturedProblem problem =
+        lumenbound::make_certified_patches_problem();
+    const lumenbound::CertificationResult without_snapshots =
+        lumenbound::certify(
+            problem.system, problem.projection,
+            lumenbound::CertificationOptions{1.0, 1000.0, 4, false});
+    const lumenbound::CertificationResult with_snapshots =
+        lumenbound::certify(
+            problem.system, problem.projection,
+            lumenbound::CertificationOptions{1.0, 1000.0, 4, true});
+
+    require(without_snapshots.iterations.empty(),
+            "default certification retained diagnostic snapshots");
+    require(!without_snapshots.certificate.iteration_snapshots_retained,
+            "certificate metadata incorrectly reports retained snapshots");
+    require(with_snapshots.certificate.iteration_snapshots_retained,
+            "opt-in snapshot capture was not recorded");
+    require(with_snapshots.iterations.size() ==
+                with_snapshots.certificate.interval_iteration_count + 1U,
+            "opt-in snapshots do not match the affine iteration count");
+    require(without_snapshots.certificate.problem_digest !=
+                with_snapshots.certificate.problem_digest,
+            "snapshot policy was omitted from the problem digest");
+    require(
+        std::find(without_snapshots.certificate.assumptions.begin(),
+                  without_snapshots.certificate.assumptions.end(),
+                  "certification_requires_componentwise_nonnegative_emission") !=
+            without_snapshots.certificate.assumptions.end(),
+        "certificate assumptions omit nonnegative emission");
+
+    const lumenbound::Certificate& first =
+        without_snapshots.certificate;
+    const lumenbound::Certificate& second =
+        with_snapshots.certificate;
+    require(first.proof_status == second.proof_status &&
+                first.proof_failure == second.proof_failure &&
+                first.proof_reason == second.proof_reason &&
+                first.target_status == second.target_status &&
+                first.target_reason == second.target_reason &&
+                first.contraction_upper_bound ==
+                    second.contraction_upper_bound &&
+                first.interval_iteration_count ==
+                    second.interval_iteration_count &&
+                first.residual_upper_bound ==
+                    second.residual_upper_bound &&
+                first.candidate_error_upper_bound ==
+                    second.candidate_error_upper_bound &&
+                first.mse_upper_bound == second.mse_upper_bound &&
+                first.psnr_lower_bound_kind ==
+                    second.psnr_lower_bound_kind &&
+                first.psnr_lower_bound == second.psnr_lower_bound,
+            "snapshot capture changed a proof or target field");
+    require_bound_vectors_equal(
+        first.coefficient_bounds, second.coefficient_bounds,
+        "snapshot capture changed coefficient bounds");
+    require_bound_vectors_equal(
+        first.pixel_bounds, second.pixel_bounds,
+        "snapshot capture changed pixel bounds");
+}
+
+void test_problem_digest_is_canonical_and_sensitive() {
+    const lumenbound::TransportSystem system =
+        make_scalar_system(0.25, 0.5);
+    const lumenbound::Projection projection =
+        make_scalar_projection(1.0);
+    const lumenbound::CertificationOptions options{
+        1.0, 80.0, 512, false};
+    const std::string digest =
+        lumenbound::compute_problem_digest(system, projection, options);
+    require(
+        digest ==
+            "sha256:f0a57997694460607bad06e2047785955ded9c2093962958cdcc2ef337dc44e3",
+        "canonical scalar problem digest changed");
+
+    require(
+        lumenbound::compute_problem_digest(
+            make_scalar_system(0.5, 0.5), projection, options) != digest,
+        "emission mutation did not change the problem digest");
+    require(
+        lumenbound::compute_problem_digest(
+            make_scalar_system(0.25, 0.25), projection, options) != digest,
+        "transport mutation did not change the problem digest");
+    require(
+        lumenbound::compute_problem_digest(
+            system, make_scalar_projection(0.5), options) != digest,
+        "projection mutation did not change the problem digest");
+
+    lumenbound::CertificationOptions changed = options;
+    changed.signal_peak = 2.0;
+    require(lumenbound::compute_problem_digest(
+                system, projection, changed) != digest,
+            "signal peak mutation did not change the problem digest");
+    changed = options;
+    changed.target_psnr = 81.0;
+    require(lumenbound::compute_problem_digest(
+                system, projection, changed) != digest,
+            "target mutation did not change the problem digest");
+    changed = options;
+    changed.maximum_iterations = 511;
+    require(lumenbound::compute_problem_digest(
+                system, projection, changed) != digest,
+            "iteration budget mutation did not change the problem digest");
+    changed = options;
+    changed.retain_iteration_snapshots = true;
+    require(lumenbound::compute_problem_digest(
+                system, projection, changed) != digest,
+            "snapshot policy mutation did not change the problem digest");
+
+    const lumenbound::TransportSystem ordered_bands(
+        std::vector<lumenbound::DenseVector>{
+            lumenbound::DenseVector{0.25},
+            lumenbound::DenseVector{0.5}},
+        std::vector<lumenbound::DenseMatrix>{
+            lumenbound::DenseMatrix(1, 1, {0.125}),
+            lumenbound::DenseMatrix(1, 1, {0.25})});
+    const lumenbound::TransportSystem reversed_bands(
+        std::vector<lumenbound::DenseVector>{
+            lumenbound::DenseVector{0.5},
+            lumenbound::DenseVector{0.25}},
+        std::vector<lumenbound::DenseMatrix>{
+            lumenbound::DenseMatrix(1, 1, {0.25}),
+            lumenbound::DenseMatrix(1, 1, {0.125})});
+    require(
+        lumenbound::compute_problem_digest(
+            ordered_bands, projection, options) !=
+            lumenbound::compute_problem_digest(
+                reversed_bands, projection, options),
+        "band permutation did not change the problem digest");
+
+    const lumenbound::TransportSystem extra_operator(
+        std::vector<lumenbound::DenseVector>{
+            lumenbound::DenseVector{0.25}},
+        std::vector<lumenbound::DenseMatrix>{
+            lumenbound::DenseMatrix(1, 1, {0.5}),
+            lumenbound::DenseMatrix(1, 1, {0.125})});
+    require(
+        lumenbound::compute_problem_digest(
+            extra_operator, projection, options) != digest,
+        "an unmatched transport operator was omitted from the digest");
+
+    const std::string positive_zero_digest =
+        lumenbound::compute_problem_digest(
+            make_scalar_system(0.0, 0.5), projection, options);
+    const std::string negative_zero_digest =
+        lumenbound::compute_problem_digest(
+            make_scalar_system(-0.0, 0.5), projection, options);
+    require(positive_zero_digest != negative_zero_digest,
+            "the problem digest canonicalized signed zero");
 }
 
 void test_signed_candidate_residual_arithmetic() {
@@ -597,8 +894,8 @@ void test_projection_contains_exact_pixels() {
             require(bound.lower <= exact_pixels[pixel] &&
                         exact_pixels[pixel] <= bound.upper,
                     "projected interval excluded an exact pixel coefficient");
-            require(bound.status ==
-                        lumenbound::CertificateStatus::Certified,
+            require(bound.proof_status ==
+                        lumenbound::ProofStatus::Certified,
                     "projected bound did not inherit certified status");
             require(bound.error_bound >=
                         std::abs(bound.candidate - exact_pixels[pixel]),
@@ -705,10 +1002,12 @@ void test_noncontractive_system_is_rejected() {
         lumenbound::certify(
             system, make_scalar_projection(1.0),
             lumenbound::CertificationOptions{1.0, 0.0, 8});
-    require_status(
-        result,
-        lumenbound::CertificateStatus::UncertifiedNonContractive,
+    require_proof(
+        result, lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::NonContractive,
         "non-contractive system received an incorrect certificate status");
+    require_target(result, lumenbound::TargetStatus::NotEvaluated,
+                   "a rejected system evaluated the requested target");
 }
 
 void test_invalid_values_have_distinct_statuses() {
@@ -721,11 +1020,11 @@ void test_invalid_values_have_distinct_statuses() {
         lumenbound::certify(
             make_scalar_system(not_a_number, 0.25),
             make_scalar_projection(1.0), options);
-    require_status(
-        nonfinite_emission,
-        lumenbound::CertificateStatus::UncertifiedNonFiniteInput,
+    require_proof(
+        nonfinite_emission, lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::NonFiniteInput,
         "non-finite emission received an incorrect status");
-    require(nonfinite_emission.certificate.reason ==
+    require(nonfinite_emission.certificate.proof_reason ==
                 "emission_contains_non_finite_value",
             "non-finite emission received an imprecise reason");
 
@@ -733,11 +1032,11 @@ void test_invalid_values_have_distinct_statuses() {
         lumenbound::certify(
             make_scalar_system(0.5, infinity),
             make_scalar_projection(1.0), options);
-    require_status(
-        nonfinite_transport,
-        lumenbound::CertificateStatus::UncertifiedNonFiniteInput,
+    require_proof(
+        nonfinite_transport, lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::NonFiniteInput,
         "non-finite transport received an incorrect status");
-    require(nonfinite_transport.certificate.reason ==
+    require(nonfinite_transport.certificate.proof_reason ==
                 "transport_contains_non_finite_value",
             "non-finite transport received an imprecise reason");
 
@@ -745,46 +1044,64 @@ void test_invalid_values_have_distinct_statuses() {
         lumenbound::certify(
             make_scalar_system(-0.5, 0.25),
             make_scalar_projection(1.0), options);
-    require_status(
-        negative_emission,
-        lumenbound::CertificateStatus::UncertifiedNegativeEmission,
+    require_proof(
+        negative_emission, lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::NegativeEmission,
         "negative emission received an incorrect status");
 
     const lumenbound::CertificationResult negative_transport =
         lumenbound::certify(
             make_scalar_system(0.5, -0.25),
             make_scalar_projection(1.0), options);
-    require_status(
-        negative_transport,
-        lumenbound::CertificateStatus::UncertifiedNegativeTransport,
+    require_proof(
+        negative_transport, lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::NegativeTransport,
         "negative transport received an incorrect status");
 
     const lumenbound::CertificationResult negative_projection =
         lumenbound::certify(
             make_scalar_system(0.5, 0.25),
             make_scalar_projection(-1.0), options);
-    require_status(
-        negative_projection,
-        lumenbound::CertificateStatus::UncertifiedNegativeProjection,
+    require_proof(
+        negative_projection, lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::NegativeProjection,
         "negative projection received an incorrect status");
 
     const lumenbound::CertificationResult nonfinite_projection =
         lumenbound::certify(
             make_scalar_system(0.5, 0.25),
             make_scalar_projection(infinity), options);
-    require_status(
-        nonfinite_projection,
-        lumenbound::CertificateStatus::UncertifiedNonFiniteInput,
+    require_proof(
+        nonfinite_projection, lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::NonFiniteInput,
         "non-finite projection received an incorrect status");
-    require(nonfinite_projection.certificate.reason ==
+    require(nonfinite_projection.certificate.proof_reason ==
                 "projection_contains_non_finite_value",
             "non-finite projection received an imprecise reason");
 
-    require(negative_emission.certificate.status !=
-                negative_transport.certificate.status &&
-                negative_transport.certificate.status !=
-                    negative_projection.certificate.status,
-            "negative input causes were collapsed into one status");
+    require(negative_emission.certificate.proof_failure !=
+                negative_transport.certificate.proof_failure &&
+                negative_transport.certificate.proof_failure !=
+                    negative_projection.certificate.proof_failure,
+            "negative input causes were collapsed into one failure code");
+    require_target(nonfinite_emission,
+                   lumenbound::TargetStatus::NotEvaluated,
+                   "an invalid emission evaluated the target");
+    require_target(nonfinite_transport,
+                   lumenbound::TargetStatus::NotEvaluated,
+                   "an invalid transport evaluated the target");
+    require_target(negative_emission,
+                   lumenbound::TargetStatus::NotEvaluated,
+                   "a negative emission evaluated the target");
+    require_target(negative_transport,
+                   lumenbound::TargetStatus::NotEvaluated,
+                   "a negative transport evaluated the target");
+    require_target(negative_projection,
+                   lumenbound::TargetStatus::NotEvaluated,
+                   "a negative projection evaluated the target");
+    require_target(nonfinite_projection,
+                   lumenbound::TargetStatus::NotEvaluated,
+                   "an invalid projection evaluated the target");
 }
 
 void test_invalid_dimensions_and_metric_options_are_rejected() {
@@ -799,10 +1116,13 @@ void test_invalid_dimensions_and_metric_options_are_rejected() {
             lumenbound::Projection(
                 lumenbound::DenseMatrix(1, 2, {1.0, 0.0})),
             lumenbound::CertificationOptions{1.0, 0.0, 8});
-    require_status(
-        invalid_dimensions,
-        lumenbound::CertificateStatus::UncertifiedInvalidDimensions,
+    require_proof(
+        invalid_dimensions, lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::InvalidDimensions,
         "invalid transport dimensions received an incorrect status");
+    require_target(invalid_dimensions,
+                   lumenbound::TargetStatus::NotEvaluated,
+                   "invalid transport dimensions evaluated the target");
 
     const lumenbound::CertificationResult invalid_projection_dimensions =
         lumenbound::certify(
@@ -810,20 +1130,32 @@ void test_invalid_dimensions_and_metric_options_are_rejected() {
             lumenbound::Projection(
                 lumenbound::DenseMatrix(1, 2, {1.0, 0.0})),
             lumenbound::CertificationOptions{1.0, 0.0, 8});
-    require_status(
+    require_proof(
         invalid_projection_dimensions,
-        lumenbound::CertificateStatus::UncertifiedInvalidDimensions,
+        lumenbound::ProofStatus::Uncertified,
+        lumenbound::ProofFailureCode::InvalidDimensions,
         "invalid projection dimensions received an incorrect status");
+    require_target(invalid_projection_dimensions,
+                   lumenbound::TargetStatus::NotEvaluated,
+                   "invalid projection dimensions evaluated the target");
 
     const lumenbound::CertificationResult invalid_peak =
         lumenbound::certify(
             make_scalar_system(0.5, 0.25),
             make_scalar_projection(1.0),
             lumenbound::CertificationOptions{0.0, 0.0, 8});
-    require_status(
-        invalid_peak,
-        lumenbound::CertificateStatus::UncertifiedInvalidSignalPeak,
-        "nonpositive signal peak received an incorrect status");
+    require_proof(invalid_peak, lumenbound::ProofStatus::Certified,
+                  lumenbound::ProofFailureCode::None,
+                  "an invalid peak erased a valid finite-system proof");
+    require_target(invalid_peak, lumenbound::TargetStatus::InvalidTarget,
+                   "a nonpositive peak received the wrong target status");
+    require(invalid_peak.certificate.mse_upper_bound.has_value(),
+            "an invalid peak erased the MSE upper bound");
+    require(invalid_peak.certificate.psnr_lower_bound_kind ==
+                lumenbound::PsnrBoundKind::Unavailable &&
+                !invalid_peak.certificate.psnr_lower_bound.has_value(),
+            "an invalid peak produced a PSNR bound");
+    require_certified_bounds(invalid_peak.certificate);
 
     const lumenbound::CertificationResult invalid_target =
         lumenbound::certify(
@@ -831,10 +1163,18 @@ void test_invalid_dimensions_and_metric_options_are_rejected() {
             make_scalar_projection(1.0),
             lumenbound::CertificationOptions{
                 1.0, std::numeric_limits<double>::infinity(), 8});
-    require_status(
-        invalid_target,
-        lumenbound::CertificateStatus::UncertifiedInvalidTarget,
-        "non-finite PSNR target received an incorrect status");
+    require_proof(invalid_target, lumenbound::ProofStatus::Certified,
+                  lumenbound::ProofFailureCode::None,
+                  "an invalid target erased a valid finite-system proof");
+    require_target(invalid_target, lumenbound::TargetStatus::InvalidTarget,
+                   "a non-finite PSNR target received an incorrect status");
+    require(invalid_target.certificate.mse_upper_bound.has_value(),
+            "an invalid target erased the MSE upper bound");
+    require(invalid_target.certificate.psnr_lower_bound_kind ==
+                lumenbound::PsnrBoundKind::Finite &&
+                invalid_target.certificate.psnr_lower_bound.has_value(),
+            "an invalid target erased an independently valid PSNR bound");
+    require_certified_bounds(invalid_target.certificate);
 
     require_throws<std::invalid_argument>(
         []() {
@@ -880,36 +1220,52 @@ void test_invalid_demo_inputs_remain_machine_readable() {
                 80.0,
                 16},
             peak_summary, peak_errors);
-    require_status(
+    require_proof(
+        invalid_peak.certification, lumenbound::ProofStatus::Certified,
+        lumenbound::ProofFailureCode::None,
+        "invalid demo peak erased the finite-system proof");
+    require_target(
         invalid_peak.certification,
-        lumenbound::CertificateStatus::UncertifiedInvalidSignalPeak,
-        "invalid demo peak lost its validation status");
-    require(invalid_peak.certification.certificate.reason ==
+        lumenbound::TargetStatus::InvalidTarget,
+        "invalid demo peak lost its target status");
+    require(invalid_peak.certification.certificate.target_reason ==
                 "signal_peak_must_be_finite_and_positive",
             "invalid demo peak lost its machine-readable reason");
+    require(invalid_peak.certification.certificate.mse_upper_bound.has_value(),
+            "invalid demo peak erased the MSE upper bound");
+    require(invalid_peak.certification.certificate.psnr_lower_bound_kind ==
+                lumenbound::PsnrBoundKind::Unavailable,
+            "invalid demo peak produced a PSNR bound");
     const std::string peak_certificate =
         read_binary_file(peak_output / "certificate.json");
     require(
-        peak_certificate.find("\"status\":\""
-                              "UncertifiedInvalidSignalPeak\"") !=
+        peak_certificate.find("\"proof_status\":\"Certified\"") !=
+                std::string::npos &&
+            peak_certificate.find(
+                "\"target_status\":\"InvalidTarget\"") !=
                 std::string::npos &&
             peak_certificate.find("\"classification\":\"nan\"") !=
                 std::string::npos &&
-            peak_certificate.find("\"mse_upper_bound\":null") !=
+            peak_certificate.find(
+                "\"psnr_lower_bound\":{\"kind\":\"unavailable\"") !=
+                std::string::npos &&
+            peak_certificate.find("\"problem_digest\":\"sha256:") !=
+                std::string::npos &&
+            peak_certificate.find("\"mse_upper_bound\":null") ==
                 std::string::npos,
         "invalid demo peak was not serialized explicitly");
     require(!std::filesystem::exists(peak_output / "preview.ppm"),
             "invalid demo peak retained a stale preview");
-    require(!std::filesystem::exists(
+    require(std::filesystem::exists(
                 peak_output / "candidate-coefficients.csv"),
-            "invalid demo peak retained stale candidate data");
+            "invalid demo peak discarded the valid candidate");
     const std::string peak_metrics =
         read_binary_file(peak_output / "metrics.json");
     require(
         peak_metrics.find(
-            "\"maximum_coefficient_interval_width\":null") !=
+            "\"maximum_coefficient_interval_width\":null") ==
             std::string::npos,
-        "invalid demo peak reported an unestablished interval width");
+        "invalid demo peak erased an established interval width");
 
     std::ostringstream target_summary;
     std::ostringstream target_errors;
@@ -923,18 +1279,38 @@ void test_invalid_demo_inputs_remain_machine_readable() {
                 std::numeric_limits<double>::infinity(),
                 16},
             target_summary, target_errors);
-    require_status(
+    require_proof(
+        invalid_target.certification, lumenbound::ProofStatus::Certified,
+        lumenbound::ProofFailureCode::None,
+        "invalid demo target erased the finite-system proof");
+    require_target(
         invalid_target.certification,
-        lumenbound::CertificateStatus::UncertifiedInvalidTarget,
-        "invalid demo target lost its validation status");
+        lumenbound::TargetStatus::InvalidTarget,
+        "invalid demo target lost its target status");
+    require(invalid_target.certification.certificate.mse_upper_bound
+                .has_value(),
+            "invalid demo target erased the MSE upper bound");
+    require(invalid_target.certification.certificate.psnr_lower_bound_kind ==
+                lumenbound::PsnrBoundKind::Finite &&
+                invalid_target.certification.certificate.psnr_lower_bound
+                    .has_value(),
+            "invalid demo target erased an independently valid PSNR bound");
     const std::string target_certificate =
         read_binary_file(target_output / "certificate.json");
     require(
         target_certificate.find(
-            "\"status\":\"UncertifiedInvalidTarget\"") !=
+            "\"proof_status\":\"Certified\"") !=
+                std::string::npos &&
+            target_certificate.find(
+                "\"target_status\":\"InvalidTarget\"") !=
                 std::string::npos &&
             target_certificate.find(
                 "\"classification\":\"positive_infinity\"") !=
+                std::string::npos &&
+            target_certificate.find(
+                "\"psnr_lower_bound\":{\"kind\":\"finite\"") !=
+                std::string::npos &&
+            target_certificate.find("\"problem_digest\":\"sha256:") !=
                 std::string::npos,
         "invalid demo target was not serialized explicitly");
 }
@@ -962,11 +1338,25 @@ void test_demo_is_deterministic_and_emits_all_outputs() {
 
     require(first_run.exit_code == 0 && second_run.exit_code == 0,
             "documented demonstration command did not succeed");
-    require(first_run.certification.certificate.status ==
-                lumenbound::CertificateStatus::Certified &&
-                second_run.certification.certificate.status ==
-                    lumenbound::CertificateStatus::Certified,
-            "demonstration did not return certified status");
+    require_proof(
+        first_run.certification, lumenbound::ProofStatus::Certified,
+        lumenbound::ProofFailureCode::None,
+        "first demonstration did not return a certified proof");
+    require_target(first_run.certification,
+                   lumenbound::TargetStatus::Reached,
+                   "first demonstration did not reach its target");
+    require_proof(
+        second_run.certification, lumenbound::ProofStatus::Certified,
+        lumenbound::ProofFailureCode::None,
+        "second demonstration did not return a certified proof");
+    require_target(second_run.certification,
+                   lumenbound::TargetStatus::Reached,
+                   "second demonstration did not reach its target");
+    require(first_run.certification.certificate.interval_iteration_count ==
+                0U &&
+                second_run.certification.certificate
+                        .interval_iteration_count == 0U,
+            "the documented target required an affine interval iteration");
     require(first_errors.str().empty() && second_errors.str().empty(),
             "successful demonstration wrote an error");
     require(first_summary.str() == second_summary.str(),
@@ -999,12 +1389,403 @@ void test_demo_is_deterministic_and_emits_all_outputs() {
                 "demonstration produced an empty output file");
     }
 
-    require(read_binary_file(first / "certificate.json") ==
-                read_binary_file(second / "certificate.json"),
+    const std::string first_certificate =
+        read_binary_file(first / "certificate.json");
+    const std::string second_certificate =
+        read_binary_file(second / "certificate.json");
+    const std::string first_metrics =
+        read_binary_file(first / "metrics.json");
+    const std::string second_metrics =
+        read_binary_file(second / "metrics.json");
+    require(first_certificate == second_certificate,
             "certificate files are not byte-identical");
-    require(read_binary_file(first / "metrics.json") ==
-                read_binary_file(second / "metrics.json"),
+    require(first_metrics == second_metrics,
             "metric files are not byte-identical");
+    require(
+        first_certificate.find(
+            "\"schema_version\":\"lumenbound.certificate.v2\"") !=
+                std::string::npos &&
+            first_certificate.find(
+                "\"certificate_scope\":"
+                "\"finite_dimensional_positive_binary64_transport\"") !=
+                std::string::npos &&
+            first_certificate.find("\"solver_version\":\"0.3.0\"") !=
+                std::string::npos &&
+            first_certificate.find(
+                "\"arithmetic_policy\":"
+                "\"binary64-outward-rounded-v1\"") !=
+                std::string::npos &&
+            first_certificate.find("\"proof_status\":\"Certified\"") !=
+                std::string::npos &&
+            first_certificate.find("\"target_status\":\"Reached\"") !=
+                std::string::npos,
+        "certificate output omitted a v2 contract identity field");
+    require(
+        first_metrics.find(
+            "\"schema_version\":\"lumenbound.metrics.v2\"") !=
+                std::string::npos &&
+            first_metrics.find("\"problem_digest\":\"sha256:") !=
+                std::string::npos &&
+            first_metrics.find("\"proof_status\":\"Certified\"") !=
+                std::string::npos &&
+            first_metrics.find("\"target_status\":\"Reached\"") !=
+                std::string::npos,
+        "metrics output omitted a v2 contract identity field");
+    require(
+        read_binary_file(first / "preview.ppm")
+                .find("False-color coefficient preview; not certified") !=
+            std::string::npos,
+        "preview output was not labeled as false color");
+}
+
+void test_sparse_projection_preserves_dense_contract() {
+    const lumenbound::Projection dense(lumenbound::DenseMatrix(
+        2, 3,
+        {
+            0.25, 0.0, 0.75,
+            0.0, 1.0, 0.0,
+        }));
+    const lumenbound::Projection sparse(
+        2, 3,
+        std::vector<std::size_t>{0, 2, 3},
+        std::vector<std::size_t>{0, 2, 1},
+        std::vector<double>{0.25, 0.75, 1.0});
+
+    require(dense.stored_entry_count() == 3 &&
+                sparse.stored_entry_count() == 3,
+            "projection CSR retained implicit positive zeros");
+    require(dense.validate(3).valid() &&
+                sparse.validate(3).valid(),
+            "equivalent dense and sparse projections did not validate");
+
+    const lumenbound::DenseVector coefficients{2.0, 3.0, 4.0};
+    const lumenbound::DenseVector dense_values =
+        dense.project(coefficients);
+    const lumenbound::DenseVector sparse_values =
+        sparse.project(coefficients);
+    require(dense_values.values() == sparse_values.values() &&
+                dense_values[0] == 3.5 && dense_values[1] == 3.0,
+            "sparse projection changed the dense projection result");
+
+    const lumenbound::DenseVector lower{1.0, 2.0, 3.0};
+    const lumenbound::DenseVector upper{2.0, 3.0, 4.0};
+    const std::vector<lumenbound::Interval> dense_intervals =
+        dense.project(lower, upper);
+    const std::vector<lumenbound::Interval> sparse_intervals =
+        sparse.project(lower, upper);
+    require(dense_intervals.size() == sparse_intervals.size(),
+            "sparse interval projection changed row count");
+    for (std::size_t row = 0; row < dense_intervals.size(); ++row) {
+        require(dense_intervals[row].lower() ==
+                    sparse_intervals[row].lower() &&
+                    dense_intervals[row].upper() ==
+                    sparse_intervals[row].upper(),
+                "sparse interval projection changed an enclosure");
+    }
+
+    require_throws<std::invalid_argument>(
+        []() {
+            static_cast<void>(lumenbound::Projection(
+                1, 2,
+                std::vector<std::size_t>{0, 2},
+                std::vector<std::size_t>{1, 1},
+                std::vector<double>{0.5, 0.5}));
+        },
+        "sparse projection accepted duplicate columns");
+    require_throws<std::invalid_argument>(
+        []() {
+            static_cast<void>(lumenbound::Projection(
+                1, 2,
+                std::vector<std::size_t>{0, 1},
+                std::vector<std::size_t>{2},
+                std::vector<double>{1.0}));
+        },
+        "sparse projection accepted an out-of-range column");
+
+    const double negative_zero = -0.0;
+    const lumenbound::Projection signed_zero(lumenbound::DenseMatrix(
+        1, 1, {negative_zero}));
+    require(signed_zero.stored_entry_count() == 1 &&
+                std::signbit(signed_zero.values().front()),
+            "dense-to-CSR conversion erased supplied negative zero");
+    const lumenbound::Projection nonfinite(lumenbound::DenseMatrix(
+        1, 1,
+        {std::numeric_limits<double>::quiet_NaN()}));
+    require(nonfinite.stored_entry_count() == 1 &&
+                nonfinite.validate(1).code ==
+                    lumenbound::ProjectionValidationCode::NonFiniteInput,
+            "dense-to-CSR conversion hid a non-finite projection value");
+}
+
+void test_diffuse_patch_assembly_is_positive_and_contractive() {
+    const lumenbound::CornellBoxProblem problem =
+        lumenbound::make_cornell_box_problem(16, 16);
+    const lumenbound::DiffusePatchAssemblyDiagnostics& diagnostics =
+        problem.assembly.diagnostics;
+    require(diagnostics.surface_count == 16 &&
+                diagnostics.patch_count == 274 &&
+                diagnostics.coefficient_band_count == 3,
+            "Cornell patch ordering or dimensions changed unexpectedly");
+    require(diagnostics.transport_ray_count ==
+                diagnostics.patch_count * 1024U,
+            "Cornell transport quadrature ray count is incorrect");
+    require(diagnostics.maximum_form_factor_row_sum <= 1.0 &&
+                diagnostics.maximum_reflectance == 0.75 &&
+                diagnostics.ray_origin_offset == 1.0e-7 &&
+                diagnostics.intersection_epsilon == 1.0e-10,
+            "Cornell quadrature violated its row-energy construction");
+
+    const lumenbound::TransportValidationReport transport_report =
+        problem.assembly.system.validate();
+    const lumenbound::ProjectionValidationReport projection_report =
+        problem.assembly.projection.validate(
+            problem.assembly.system.transport_coefficient_count());
+    require(transport_report.valid() &&
+                transport_report.contraction_upper_bound < 1.0,
+            "Cornell finite transport system is not contractive");
+    require(transport_report.contraction_upper_bound <=
+                0.7500000000001,
+            "Cornell contraction bound is inconsistent with reflectance");
+    require(projection_report.valid(),
+            "Cornell camera projection is invalid");
+    require(problem.assembly.projection.stored_entry_count() ==
+                diagnostics.projection_nonzero_count,
+            "Cornell projection diagnostics report the wrong CSR size");
+
+    const std::vector<std::size_t>& row_offsets =
+        problem.assembly.projection.row_offsets();
+    const std::vector<double>& weights =
+        problem.assembly.projection.values();
+    for (std::size_t pixel = 0;
+         pixel < problem.assembly.projection.pixel_count(); ++pixel) {
+        double row_sum = 0.0;
+        for (std::size_t entry = row_offsets[pixel];
+             entry < row_offsets[pixel + 1U]; ++entry) {
+            require(std::isfinite(weights[entry]) &&
+                        weights[entry] >= 0.0,
+                    "Cornell projection contains an invalid weight");
+            row_sum += weights[entry];
+        }
+        require(row_sum <= 1.000000000000001,
+                "Cornell projection row exceeds unit reconstruction weight");
+    }
+
+    const lumenbound::OrientedRectangle invalid_surface{
+        "invalid",
+        {0.0, 0.0, 0.0},
+        {1.0, 0.0, 0.0},
+        {0.0, 0.0, 1.0},
+        1,
+        1,
+        lumenbound::DiffusePatchMaterial{{1.0}, {0.0}},
+    };
+    const lumenbound::PinholeCamera camera{
+        {0.0, 1.0, -1.0},
+        {0.0, 0.0, 0.0},
+        {0.0, 1.0, 0.0},
+        40.0,
+    };
+    require_throws<std::invalid_argument>(
+        [&]() {
+            static_cast<void>(
+                lumenbound::assemble_diffuse_patch_problem(
+                    {invalid_surface}, camera,
+                    lumenbound::DiffusePatchAssemblyOptions{
+                        16, 16, 2, 8, 32, 2}));
+        },
+        "diffuse assembly accepted unit reflectance");
+    require_throws<std::invalid_argument>(
+        [&]() {
+            lumenbound::OrientedRectangle degenerate = invalid_surface;
+            degenerate.material.reflectance[0] = 0.5;
+            degenerate.edge_v = {2.0, 0.0, 0.0};
+            static_cast<void>(
+                lumenbound::assemble_diffuse_patch_problem(
+                    {degenerate}, camera,
+                    lumenbound::DiffusePatchAssemblyOptions{
+                        16, 16, 2, 8, 32, 2}));
+        },
+        "diffuse assembly accepted a degenerate rectangle");
+    require_throws<std::invalid_argument>(
+        [&]() {
+            lumenbound::OrientedRectangle valid = invalid_surface;
+            valid.material.reflectance[0] = 0.5;
+            static_cast<void>(
+                lumenbound::assemble_diffuse_patch_problem(
+                    {valid}, camera,
+                    lumenbound::DiffusePatchAssemblyOptions{
+                        16, 16, 3, 8, 32, 2}));
+        },
+        "diffuse assembly accepted a non-dyadic quadrature count");
+}
+
+void test_cornell_demo_is_deterministic_and_visually_structured() {
+    const std::filesystem::path root =
+        std::filesystem::current_path() /
+        "lumenbound-test-output-cornell";
+    const TemporaryDirectory temporary(root);
+    const std::filesystem::path first = temporary.path() / "first";
+    const std::filesystem::path second = temporary.path() / "second";
+    const lumenbound::CornellBoxDemoOptions options{
+        first, 4.0, 80.0, 32, 32, 32, 0.7};
+
+    std::ostringstream first_summary;
+    std::ostringstream first_errors;
+    const lumenbound::CornellBoxDemoRunResult first_run =
+        lumenbound::run_cornell_box(
+            options, first_summary, first_errors);
+    lumenbound::CornellBoxDemoOptions second_options = options;
+    second_options.output_directory = second;
+    std::ostringstream second_summary;
+    std::ostringstream second_errors;
+    const lumenbound::CornellBoxDemoRunResult second_run =
+        lumenbound::run_cornell_box(
+            second_options, second_summary, second_errors);
+
+    require(first_run.exit_code == 0 && second_run.exit_code == 0,
+            "Cornell demonstration did not reach its finite-system target");
+    require_proof(
+        first_run.certification, lumenbound::ProofStatus::Certified,
+        lumenbound::ProofFailureCode::None,
+        "Cornell finite system was not certified");
+    require_target(
+        first_run.certification, lumenbound::TargetStatus::Reached,
+        "Cornell finite-system target was not reached");
+    require(first_summary.str().find(
+                "continuous_scene_certified: false") !=
+                std::string::npos &&
+                first_summary.str().find(
+                    "assembly_status: DeterministicUnbounded") !=
+                std::string::npos,
+            "Cornell console summary obscures the assembly proof boundary");
+    require(first_errors.str().empty() &&
+                second_errors.str().empty(),
+            "Cornell demonstration emitted an unexpected error");
+
+    const std::array<std::string_view, 7> output_names{
+        "candidate-coefficients.csv",
+        "coefficient-bounds.csv",
+        "linear-pixels.csv",
+        "preview.ppm",
+        "metrics.json",
+        "certificate.json",
+        "assembly.json",
+    };
+    for (const std::string_view name : output_names) {
+        require(read_binary_file(first / name) ==
+                    read_binary_file(second / name),
+                "Cornell output is not byte-identical: " +
+                    std::string(name));
+    }
+
+    const std::string preview =
+        read_binary_file(first / "preview.ppm");
+    require(preview.starts_with("P3\n") &&
+                preview.find(
+                    "Declared linear-sRGB preview; non-certifying") !=
+                    std::string::npos &&
+                preview.find("\n32 32\n255\n") != std::string::npos,
+            "Cornell preview has an invalid format or proof label");
+    const std::string assembly =
+        read_binary_file(first / "assembly.json");
+    require(assembly.find(
+                "\"continuous_scene\":false") !=
+                std::string::npos &&
+                assembly.find(
+                    "\"geometry\":false") != std::string::npos &&
+                assembly.find(
+                    "\"visibility\":false") != std::string::npos &&
+                assembly.find(
+                    "\"finite_system_proof_status\":\"Certified\"") !=
+                    std::string::npos &&
+                assembly.find(
+                    "\"problem_digest\":\"sha256:") !=
+                    std::string::npos,
+            "Cornell assembly record omits its proof boundary");
+
+    const lumenbound::Certificate& certificate =
+        first_run.certification.certificate;
+    const auto pixel_value =
+        [&certificate](std::size_t band, std::size_t x,
+                       std::size_t y) {
+            const std::size_t pixel = (y * 32U) + x;
+            return find_bound(
+                       certificate.pixel_bounds, band, pixel)
+                .candidate;
+        };
+    require(pixel_value(0, 3, 16) >
+                5.0 * pixel_value(1, 3, 16),
+            "Cornell left wall is not red-dominant");
+    require(pixel_value(1, 28, 16) >
+                5.0 * pixel_value(0, 28, 16),
+            "Cornell right wall is not green-dominant");
+    require(pixel_value(0, 16, 4) > 3.0 &&
+                pixel_value(1, 16, 4) > 3.0 &&
+                pixel_value(2, 16, 4) > 2.5,
+            "Cornell ceiling emitter is not visible");
+
+    const std::filesystem::path alternate_preview =
+        temporary.path() / "alternate-preview";
+    lumenbound::write_demo_outputs(
+        alternate_preview, first_run.certification, 32, 32,
+        lumenbound::PreviewSettings{
+            lumenbound::PreviewMapping::DeclaredLinearSrgb, 0.5});
+    require(read_binary_file(first / "certificate.json") ==
+                read_binary_file(alternate_preview / "certificate.json") &&
+                read_binary_file(first / "linear-pixels.csv") ==
+                read_binary_file(
+                    alternate_preview / "linear-pixels.csv"),
+            "preview exposure changed a proof-bearing Cornell output");
+    require(read_binary_file(first / "preview.ppm") !=
+                read_binary_file(alternate_preview / "preview.ppm"),
+            "preview exposure did not change the display-only output");
+
+    lumenbound::CornellBoxDemoOptions preview_only_options = options;
+    preview_only_options.output_directory =
+        temporary.path() / "preview-only";
+    preview_only_options.preview_only = true;
+    std::ostringstream preview_only_summary;
+    std::ostringstream preview_only_errors;
+    const lumenbound::CornellBoxDemoRunResult preview_only_run =
+        lumenbound::run_cornell_box(
+            preview_only_options, preview_only_summary,
+            preview_only_errors);
+    require(preview_only_run.exit_code == 0 &&
+                preview_only_errors.str().empty(),
+            "Cornell preview-only render failed");
+    require(preview_only_summary.str().find(
+                "render_mode: PreviewOnly") != std::string::npos &&
+                preview_only_summary.str().find(
+                    "finite_system_proof_status: NotRun") !=
+                    std::string::npos,
+            "Cornell preview-only summary implies certification");
+    const std::filesystem::path preview_only_directory =
+        preview_only_options.output_directory;
+    const std::string preview_only =
+        read_binary_file(preview_only_directory / "preview.ppm");
+    require(preview_only.find(
+                "Preview-only candidate render; no certificate generated") !=
+                std::string::npos &&
+                !std::filesystem::exists(
+                    preview_only_directory / "certificate.json") &&
+                !std::filesystem::exists(
+                    preview_only_directory / "metrics.json") &&
+                !std::filesystem::exists(
+                    preview_only_directory / "assembly.json"),
+            "Cornell preview-only output obscures its proof boundary");
+
+    lumenbound::CornellBoxDemoOptions invalid = options;
+    invalid.image_width = 8;
+    std::ostringstream invalid_summary;
+    std::ostringstream invalid_errors;
+    const lumenbound::CornellBoxDemoRunResult invalid_run =
+        lumenbound::run_cornell_box(
+            invalid, invalid_summary, invalid_errors);
+    require(invalid_run.exit_code != 0 &&
+                invalid_errors.str().find(
+                    "cornell_image_dimensions_must_be_16_to_256") !=
+                    std::string::npos,
+            "Cornell demo did not reject an unsupported image size");
 }
 
 void test_iteration_budget_failure_is_explicit() {
@@ -1017,19 +1798,23 @@ void test_iteration_budget_failure_is_explicit() {
     const lumenbound::DemoRunResult run =
         lumenbound::run_certified_patches(
             lumenbound::DemoOptions{temporary.path() / "run",
-                                    1.0, 80.0, 0},
+                                    1.0, 1000.0, 0},
             summary, errors);
 
     require(run.exit_code != 0,
             "zero iteration budget returned a successful exit code");
-    require_status(
-        run.certification,
-        lumenbound::CertificateStatus::UncertifiedIterationLimit,
-        "zero iteration budget received an incorrect status");
-    require(run.certification.certificate.reason ==
+    require_proof(
+        run.certification, lumenbound::ProofStatus::Certified,
+        lumenbound::ProofFailureCode::None,
+        "zero iteration budget invalidated an established proof");
+    require_target(
+        run.certification, lumenbound::TargetStatus::IterationLimit,
+        "zero iteration budget received an incorrect target status");
+    require_certified_bounds(run.certification.certificate);
+    require(run.certification.certificate.target_reason ==
                 "zero_iteration_budget_before_target",
             "zero iteration budget received an imprecise reason");
-    require(errors.str().find("UncertifiedIterationLimit") !=
+    require(errors.str().find("IterationLimit") !=
                 std::string::npos &&
                 errors.str().find(
                     "zero_iteration_budget_before_target") !=
@@ -1052,14 +1837,18 @@ void test_impossible_target_failure_is_explicit() {
 
     require(run.exit_code != 0,
             "unreachable PSNR target returned a successful exit code");
-    require_status(
-        run.certification,
-        lumenbound::CertificateStatus::UncertifiedTargetNotReached,
+    require_proof(
+        run.certification, lumenbound::ProofStatus::Certified,
+        lumenbound::ProofFailureCode::None,
+        "target stagnation invalidated an established proof");
+    require_target(
+        run.certification, lumenbound::TargetStatus::Stagnated,
         "unreachable PSNR target received an incorrect status");
-    require(run.certification.certificate.reason ==
+    require_certified_bounds(run.certification.certificate);
+    require(run.certification.certificate.target_reason ==
                 "interval_propagation_stagnated_before_target",
             "unreachable PSNR target received an imprecise reason");
-    require(errors.str().find("UncertifiedTargetNotReached") !=
+    require(errors.str().find("Stagnated") !=
                 std::string::npos,
             "unreachable-target failure was not explained on stderr");
 }
@@ -1083,8 +1872,7 @@ int main() {
          test_certified_logarithm_known_values},
         {"rounding mode is preserved",
          test_rounding_mode_is_preserved},
-        {"dense algebra and spectrum order",
-         test_dense_algebra_and_spectrum_order},
+        {"dense algebra", test_dense_algebra},
         {"candidate solver matches manufactured solution",
          test_candidate_solver_matches_manufactured_solution},
         {"iteration snapshots are monotone and enclosing",
@@ -1093,6 +1881,12 @@ int main() {
          test_iteration_width_contracts},
         {"residual certificate contains measured errors",
          test_residual_certificate_contains_measured_errors},
+        {"target outcomes preserve certified proof",
+         test_target_outcomes_preserve_certified_proof},
+        {"iteration snapshots are opt-in and proof-neutral",
+         test_iteration_snapshots_are_opt_in_and_proof_neutral},
+        {"problem digest is canonical and sensitive",
+         test_problem_digest_is_canonical_and_sensitive},
         {"signed candidate residual arithmetic",
          test_signed_candidate_residual_arithmetic},
         {"projection contains exact pixels",
@@ -1111,6 +1905,12 @@ int main() {
          test_invalid_demo_inputs_remain_machine_readable},
         {"demo is deterministic and complete",
          test_demo_is_deterministic_and_emits_all_outputs},
+        {"sparse projection preserves dense contract",
+         test_sparse_projection_preserves_dense_contract},
+        {"diffuse patch assembly is positive and contractive",
+         test_diffuse_patch_assembly_is_positive_and_contractive},
+        {"Cornell demo is deterministic and visually structured",
+         test_cornell_demo_is_deterministic_and_visually_structured},
         {"iteration budget failure is explicit",
          test_iteration_budget_failure_is_explicit},
         {"impossible target failure is explicit",

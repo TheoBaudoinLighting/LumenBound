@@ -5,51 +5,76 @@ gate closes, but it must not inherit certified status until its own proof
 obligation and exit criterion are met. Tests listed here are minimum evidence,
 not substitutes for derivations or runtime checks.
 
+The Cornell demonstration is such experimental work. Its deterministic
+rectangle collocation and sparse camera projection feed binary64 `e`, `T`, and
+`P` to M0, but geometry, visibility, quadrature, discretization, continuous
+camera formation, declared linear-sRGB semantics, and display conversion
+remain outside the certificate.
+
 ## M0: Certified finite-dimensional positive transport core
 
 **Scope.** Implement the CPU binary64 reference path for independent finite
 systems `x = e + T x`, deterministic dense candidate solving, monotone
-interval enclosure, nonnegative projection, residual bounds, raw-linear MSE
-and PSNR bounds, explicit statuses, and deterministic output.
+interval enclosure, residual-derived enclosure intersection, nonnegative
+projection, raw-linear MSE and PSNR bounds, separate proof and target states,
+canonical SHA-256 problem identity, and deterministic schema v2 output.
 
 **Proof obligation.** Runtime checks establish finite compatible dimensions,
 componentwise nonnegative `e`, `T`, and `P`, and a conservative
 `q_bar >= ||T||_infinity` with `q_bar < 1`. Outward arithmetic preserves
 coefficient and projected-pixel inclusion and conservatively aggregates all
-reported bounds.
+reported bounds. A target budget or stagnation event must not invalidate an
+established proof. The compiled core must enforce source-precision binary64
+evaluation, dynamic rounding, disabled contraction and fast-math, and no LTO.
 
 **Tests.** Cover interval edge cases, matrix norms, manufactured candidate
 accuracy, monotone endpoint sequences, exact-solution containment at every
 iteration, residual containment, projected containment, conservative MSE and
 PSNR, negative and non-finite inputs, non-contraction, deterministic
-serialization, target success, and target failure.
+serialization and digest coverage, proof/target state independence, opt-in
+snapshot retention, zero-iteration target success, iteration-limit target
+failure, and stagnation.
 
 **Unsupported cases.** Continuous geometry, operator assembly, visibility and
-quadrature error, general Galerkin bases, glossy and delta transport, caustics,
-media, validated colorimetry, GPU execution, and production-scale systems.
+quadrature error, weak formulations, mass matrices, general or signed Galerkin
+bases, glossy and delta transport, caustics, media, validated colorimetry, GPU
+execution, and production-scale systems.
 
 **Exit criterion.** A clean checkout configures and builds with the documented
 C++23 CMake presets; all tests pass without skips; the manufactured command
 produces byte-identical certificate and metrics records on repeated runs; all
 reported inequalities hold against the known finite solution; and
-documentation states the finite proof boundary.
+documentation states the finite proof boundary. The manufactured target is
+reached from the residual intersection with zero affine interval iterations,
+while explicit limit and stagnation cases preserve `ProofStatus::Certified`.
 
 ## M1: Deterministic diffuse patch operator assembly
 
 **Scope.** Assemble finite diffuse transport coefficients from a documented
 static patch scene representation with fixed traversal, patch orientation,
 emission, and reflectance conventions. Feed the resulting operator to M0
-without weakening its validation.
+without weakening its validation. Begin with a two-patch geometry whose finite
+radiosity solution and form-factor relations can be checked analytically.
+
+The current Cornell path is an implementation step toward this gate. It uses
+constant rectangle patches, two by two receiver points, an 8 by 32
+cosine-domain direction grid, first-hit or escape classification,
+`T^(b)_ij = rho^(b)_i F_ij`, and a positive sparse two by two camera
+projection with bilinear reconstruction. These features do not close M1.
 
 **Proof obligation.** Define the discrete diffuse form-factor model, units,
 normal conventions, reciprocity expectations, self-interaction policy, and
 energy-conservation conditions. Assembly must be deterministic and must not
-claim bounds for unresolved integration or visibility error.
+claim bounds for unresolved integration or visibility error. The initial patch
+representation is deliberately positive: assembled emission, transport, and
+projection coefficients must remain nonnegative.
 
 **Tests.** Include analytic or high-precision patch configurations,
-orientation and unit tests, row-energy checks, permutation tests with a
-specified canonical ordering, degenerate-geometry rejection, and regression
-scenes preserving raw assembled matrices.
+starting with the two-patch case; orientation and unit tests; row-energy
+checks; permutation tests with a specified canonical ordering;
+degenerate-geometry rejection; and regression scenes preserving raw assembled
+matrices. Cornell regression and determinism tests supplement, but do not
+replace, the analytic two-patch evidence.
 
 **Unsupported cases.** Certified visibility, bounded quadrature error,
 hierarchical basis functions, glossy or specular scattering, media, motion,
@@ -59,7 +84,8 @@ and a claim that the discrete matrix encloses continuous transport.
 operators whose entries and conventions match independent analytic or
 high-precision references within documented non-certified assembly tolerances;
 all unsupported geometry is rejected explicitly; and the output can be
-certified only as an M0 finite system.
+certified only as an M0 finite system. The analytic two-patch comparison and
+its documented tolerances remain required before this criterion is met.
 
 ## M2: Interval-bounded visibility and quadrature
 
@@ -116,7 +142,9 @@ class of regular, bounded, non-delta glossy scattering functions.
 
 **Proof obligation.** Enclose basis projection, BRDF evaluation, angular
 quadrature, positivity or signed-basis effects, and energy conservation.
-Regular glossy transport must remain distinct from delta/specular chains.
+Regular glossy transport must remain distinct from delta/specular chains. A
+signed basis cannot reuse the M0 positivity proof; it needs an explicit
+signed-operator enclosure and validation contract.
 
 **Tests.** Cover constant and low-order analytic lobes, reciprocity where
 required, grazing angles, roughness boundaries, basis truncation, nonnegative
@@ -302,6 +330,7 @@ camera domain.
 linear-solve, interval-rounding, path-class coupling, spectral, sensor,
 compression, and display-domain errors without omission or double counting.
 Target-PSNR stopping must be derived from the complete image error budget.
+Proof validity and target attainment remain separate states at this level.
 
 **Tests.** Include end-to-end manufactured scenes, analytic scenes, independent
 high-precision references, every supported transport-class combination,
@@ -315,5 +344,5 @@ the certificate schema and runtime validation.
 **Exit criterion.** A clean documented command either emits a machine-readable
 end-to-end certificate whose assumptions cover every accepted input and whose
 image bounds pass independent validation, or exits with a precise
-machine-readable uncertified reason. Repeated runs in each supported
+machine-readable proof or target reason. Repeated runs in each supported
 configuration reproduce all proof-bearing outputs.

@@ -9,8 +9,8 @@ namespace lumenbound {
 
 struct CandidateSolution {
     std::vector<DenseVector> values;
-    std::vector<DenseVector> nearest_residuals;
-    double nearest_residual_infinity_norm{0.0};
+    std::vector<DenseVector> residuals;
+    double residual_infinity_norm{0.0};
     double minimum_absolute_pivot{0.0};
 };
 

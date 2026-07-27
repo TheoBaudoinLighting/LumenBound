@@ -46,22 +46,16 @@ double conservative_absolute_error(double candidate,
         absolute_difference_upper(enclosure.upper(), candidate));
 }
 
-ImageMetricBounds compute_image_metric_bounds(
-    std::span<const double> absolute_error_upper_bounds,
-    double signal_peak) {
+double compute_mse_upper_bound(
+    std::span<const double> absolute_error_upper_bounds) {
     if (!math::supports_certified_rounding()) {
         throw std::runtime_error(
-            "image metric bounds require supported binary64 arithmetic");
+            "MSE bounds require supported binary64 arithmetic");
     }
     if (absolute_error_upper_bounds.empty()) {
         throw std::invalid_argument(
             "image metric evaluation requires at least one value");
     }
-    if (!std::isfinite(signal_peak) || signal_peak <= 0.0) {
-        throw std::invalid_argument(
-            "image metric signal peak must be finite and positive");
-    }
-
     double squared_error_sum = 0.0;
     for (const double error_bound : absolute_error_upper_bounds) {
         if (!std::isfinite(error_bound) || error_bound < 0.0) {
@@ -85,18 +79,44 @@ ImageMetricBounds compute_image_metric_bounds(
     const double value_count_as_double =
         static_cast<double>(value_count);
 
-    const double mse_upper =
-        math::divide_up(squared_error_sum, value_count_as_double);
-    if (mse_upper == 0.0) {
-        return {0.0, PsnrBoundKind::PositiveInfinity, std::nullopt};
+    return math::divide_up(squared_error_sum, value_count_as_double);
+}
+
+PsnrLowerBound compute_psnr_lower_bound(double mse_upper_bound,
+                                        double signal_peak) {
+    if (!math::supports_certified_rounding()) {
+        throw std::runtime_error(
+            "PSNR bounds require supported binary64 arithmetic");
+    }
+    if (!std::isfinite(mse_upper_bound) || mse_upper_bound < 0.0) {
+        throw std::invalid_argument(
+            "PSNR evaluation requires a finite nonnegative MSE bound");
+    }
+    if (!std::isfinite(signal_peak) || signal_peak <= 0.0) {
+        throw std::invalid_argument(
+            "PSNR signal peak must be finite and positive");
+    }
+    if (mse_upper_bound == 0.0) {
+        return {PsnrBoundKind::PositiveInfinity, std::nullopt};
     }
 
     const Interval peak_logarithm = certified_log10(signal_peak);
-    const Interval mse_logarithm = certified_log10(mse_upper);
+    const Interval mse_logarithm =
+        certified_log10(mse_upper_bound);
     const Interval psnr =
         (Interval::point(20.0) * peak_logarithm) -
         (Interval::point(10.0) * mse_logarithm);
-    return {mse_upper, PsnrBoundKind::Finite, psnr.lower()};
+    return {PsnrBoundKind::Finite, psnr.lower()};
+}
+
+ImageMetricBounds compute_image_metric_bounds(
+    std::span<const double> absolute_error_upper_bounds,
+    double signal_peak) {
+    const double mse_upper =
+        compute_mse_upper_bound(absolute_error_upper_bounds);
+    const PsnrLowerBound psnr =
+        compute_psnr_lower_bound(mse_upper, signal_peak);
+    return {mse_upper, psnr.kind, psnr.value};
 }
 
 }  // namespace lumenbound

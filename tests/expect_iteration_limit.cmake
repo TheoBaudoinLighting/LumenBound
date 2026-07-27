@@ -13,9 +13,9 @@ execute_process(
         --peak
         1.0
         --target-psnr
-        80
+        1000
         --max-iterations
-        1
+        0
     RESULT_VARIABLE process_result
     OUTPUT_VARIABLE process_output
     ERROR_VARIABLE process_error
@@ -27,7 +27,12 @@ if(process_result EQUAL 0)
 endif()
 
 set(combined_output "${process_output}\n${process_error}")
-if(NOT combined_output MATCHES "UncertifiedIterationLimit")
+if(NOT combined_output MATCHES "proof_status: Certified")
     message(FATAL_ERROR
-        "The demonstration did not report UncertifiedIterationLimit")
+        "The demonstration did not preserve its certified proof")
+endif()
+
+if(NOT combined_output MATCHES "target_status: IterationLimit")
+    message(FATAL_ERROR
+        "The demonstration did not report target iteration exhaustion")
 endif()

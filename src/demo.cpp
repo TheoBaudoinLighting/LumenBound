@@ -64,9 +64,22 @@ namespace {
     stream << std::setprecision(
         std::numeric_limits<double>::max_digits10);
     stream << "LumenBound certified-patches\n"
-           << "status: " << to_string(certificate.status) << '\n'
-           << "reason: " << certificate.reason << '\n'
+           << "proof_status: "
+           << to_string(certificate.proof_status) << '\n'
+           << "proof_failure: "
+           << to_string(certificate.proof_failure) << '\n'
+           << "proof_reason: " << certificate.proof_reason << '\n'
+           << "target_status: "
+           << to_string(certificate.target_status) << '\n'
+           << "target_reason: " << certificate.target_reason << '\n'
            << "backend: " << backend_name << '\n'
+           << "problem_digest: ";
+    if (certificate.problem_digest.empty()) {
+        stream << "unavailable";
+    } else {
+        stream << certificate.problem_digest;
+    }
+    stream << '\n'
            << "q_upper: ";
     if (certificate.contraction_upper_bound.has_value()) {
         stream << *certificate.contraction_upper_bound;
@@ -179,6 +192,7 @@ DemoRunResult run_certified_patches(const DemoOptions& options,
         options.signal_peak,
         options.target_psnr,
         options.maximum_iterations,
+        false,
     };
 
     const CpuReferenceBackend backend;
@@ -190,17 +204,21 @@ DemoRunResult run_certified_patches(const DemoOptions& options,
         write_demo_outputs(options.output_directory, result,
                            problem.image_width, problem.image_height);
     } catch (const std::exception&) {
-        result.certificate.status = CertificateStatus::NumericalFailure;
-        result.certificate.reason = "demo_output_write_failed";
-        errors << "demo failed: " << result.certificate.reason << '\n';
+        errors << "demo failed: demo_output_write_failed\n";
         return DemoRunResult{3, std::move(result)};
     }
 
     summary << summary_text(result.certificate, backend.name());
-    if (result.certificate.status != CertificateStatus::Certified) {
-        errors << "certification failed: "
-               << to_string(result.certificate.status) << " ("
-               << result.certificate.reason << ")\n";
+    if (result.certificate.proof_status != ProofStatus::Certified) {
+        errors << "proof failed: "
+               << to_string(result.certificate.proof_failure) << " ("
+               << result.certificate.proof_reason << ")\n";
+        return DemoRunResult{2, std::move(result)};
+    }
+    if (result.certificate.target_status != TargetStatus::Reached) {
+        errors << "target not reached: "
+               << to_string(result.certificate.target_status) << " ("
+               << result.certificate.target_reason << ")\n";
         return DemoRunResult{2, std::move(result)};
     }
     return DemoRunResult{0, std::move(result)};
