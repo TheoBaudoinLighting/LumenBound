@@ -23,6 +23,23 @@ std::size_t TransportSystem::transport_coefficient_count() const noexcept {
     return emissions_.empty() ? 0 : emissions_.front().size();
 }
 
+std::size_t TransportSystem::emission_band_count() const noexcept {
+    return emissions_.size();
+}
+
+std::size_t TransportSystem::transport_operator_count() const noexcept {
+    return transport_operators_.size();
+}
+
+const std::vector<DenseVector>& TransportSystem::emissions() const noexcept {
+    return emissions_;
+}
+
+const std::vector<DenseMatrix>&
+TransportSystem::transport_operators() const noexcept {
+    return transport_operators_;
+}
+
 const DenseVector& TransportSystem::emission(std::size_t band) const {
     return emissions_.at(band);
 }

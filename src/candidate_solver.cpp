@@ -15,12 +15,11 @@ CandidateSolution solve_candidate(const TransportSystem& system) {
     }
 
     CandidateSolution result;
-    result.nearest_residual_infinity_norm = 0.0;
+    result.residual_infinity_norm = 0.0;
     result.minimum_absolute_pivot =
         std::numeric_limits<double>::infinity();
     result.values.reserve(system.spectral_coefficient_count());
-    result.nearest_residuals.reserve(
-        system.spectral_coefficient_count());
+    result.residuals.reserve(system.spectral_coefficient_count());
 
     const std::size_t coefficient_count =
         system.transport_coefficient_count();
@@ -46,14 +45,14 @@ CandidateSolution solve_candidate(const TransportSystem& system) {
                 "candidate residual produced a non-finite value");
         }
 
-        result.nearest_residual_infinity_norm =
-            std::max(result.nearest_residual_infinity_norm,
+        result.residual_infinity_norm =
+            std::max(result.residual_infinity_norm,
                      residual.infinity_norm());
         result.minimum_absolute_pivot =
             std::min(result.minimum_absolute_pivot,
                      solve.minimum_absolute_pivot);
         result.values.push_back(std::move(solve.solution));
-        result.nearest_residuals.push_back(residual);
+        result.residuals.push_back(residual);
     }
 
     return result;

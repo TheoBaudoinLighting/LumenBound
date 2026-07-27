@@ -36,6 +36,11 @@ public:
 
     [[nodiscard]] std::size_t spectral_coefficient_count() const noexcept;
     [[nodiscard]] std::size_t transport_coefficient_count() const noexcept;
+    [[nodiscard]] std::size_t emission_band_count() const noexcept;
+    [[nodiscard]] std::size_t transport_operator_count() const noexcept;
+    [[nodiscard]] const std::vector<DenseVector>& emissions() const noexcept;
+    [[nodiscard]] const std::vector<DenseMatrix>& transport_operators()
+        const noexcept;
     [[nodiscard]] const DenseVector& emission(std::size_t band) const;
     [[nodiscard]] const DenseMatrix& transport(std::size_t band) const;
     [[nodiscard]] TransportValidationReport validate() const;

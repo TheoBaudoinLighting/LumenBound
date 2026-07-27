@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 project(
     LumenBound
-    VERSION 0.1.0
+    VERSION 0.3.0
     DESCRIPTION
         "Finite-dimensional deterministic light-transport reference core"
     LANGUAGES CXX
@@ -25,7 +25,13 @@ function(lumenbound_configure_project_target target_name)
             CXX_STANDARD_REQUIRED ON
     )
 
-    if(MSVC)
+    if(
+        CMAKE_CXX_COMPILER_ID STREQUAL "MSVC"
+        OR (
+            CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+            AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
+        )
+    )
         target_compile_options(
             ${target_name}
             PRIVATE
@@ -36,7 +42,11 @@ function(lumenbound_configure_project_target target_name)
         if(LUMENBOUND_WARNINGS_AS_ERRORS)
             target_compile_options(${target_name} PRIVATE /WX)
         endif()
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    elseif(
+        CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+        OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+        OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"
+    )
         target_compile_options(
             ${target_name}
             PRIVATE
@@ -54,9 +64,51 @@ function(lumenbound_configure_project_target target_name)
             target_compile_options(${target_name} PRIVATE -Werror)
         endif()
     else()
-        message(WARNING
-            "Strict warning and floating-point options are not defined for "
-            "compiler '${CMAKE_CXX_COMPILER_ID}'.")
+        message(FATAL_ERROR
+            "The certified core has no floating-point policy for compiler "
+            "'${CMAKE_CXX_COMPILER_ID}' with frontend "
+            "'${CMAKE_CXX_COMPILER_FRONTEND_VARIANT}'.")
+    endif()
+endfunction()
+
+function(lumenbound_disable_interprocedural_optimization target_name)
+    set_target_properties(
+        ${target_name}
+        PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION FALSE
+    )
+
+    set(
+        lumenbound_configurations
+        Debug
+        Release
+        RelWithDebInfo
+        MinSizeRel
+        ${CMAKE_CONFIGURATION_TYPES}
+        ${CMAKE_BUILD_TYPE}
+    )
+    list(REMOVE_DUPLICATES lumenbound_configurations)
+    foreach(configuration IN LISTS lumenbound_configurations)
+        if(NOT configuration STREQUAL "")
+            string(TOUPPER "${configuration}" configuration_upper)
+            set_target_properties(
+                ${target_name}
+                PROPERTIES
+                    "INTERPROCEDURAL_OPTIMIZATION_${configuration_upper}"
+                        FALSE
+            )
+        endif()
+    endforeach()
+
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(${target_name} PRIVATE /GL-)
+    elseif(
+        CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
+        AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"
+    )
+        target_compile_options(${target_name} PRIVATE /clang:-fno-lto)
+    else()
+        target_compile_options(${target_name} PRIVATE -fno-lto)
     endif()
 endfunction()
 
@@ -66,17 +118,26 @@ set(
     src/dense_vector.cpp
     src/dense_matrix.cpp
     src/transport_system.cpp
+    src/diffuse_patch_assembly.cpp
     src/candidate_solver.cpp
     src/projection.cpp
     src/image_metrics.cpp
+    src/problem_digest.cpp
     src/certifier.cpp
     src/output.cpp
     src/demo.cpp
+    src/cornell_box_demo.cpp
 )
 
 add_library(lumenbound_core STATIC ${LUMENBOUND_CORE_SOURCES})
 add_library(lumenbound::core ALIAS lumenbound_core)
 lumenbound_configure_project_target(lumenbound_core)
+lumenbound_disable_interprocedural_optimization(lumenbound_core)
+target_compile_definitions(
+    lumenbound_core
+    PRIVATE
+        LUMENBOUND_SOLVER_VERSION="${PROJECT_VERSION}"
+)
 target_include_directories(
     lumenbound_core
     PUBLIC
@@ -153,6 +214,31 @@ if(BUILD_TESTING)
     )
     set_tests_properties(
         lumenbound.demo.certified-patches
+        PROPERTIES
+            TIMEOUT 60
+    )
+
+    add_test(
+        NAME lumenbound.demo.cornell-box
+        COMMAND
+            lumenbound
+            demo
+            cornell-box
+            --output
+            "${CMAKE_BINARY_DIR}/test-output/cornell-box"
+            --width
+            32
+            --height
+            32
+            --preview-exposure
+            1.0
+            --peak
+            4.0
+            --target-psnr
+            80
+    )
+    set_tests_properties(
+        lumenbound.demo.cornell-box
         PROPERTIES
             TIMEOUT 60
     )

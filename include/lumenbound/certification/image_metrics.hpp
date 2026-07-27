@@ -21,8 +21,19 @@ struct ImageMetricBounds {
     std::optional<double> psnr_lower_bound;
 };
 
+struct PsnrLowerBound {
+    PsnrBoundKind kind;
+    std::optional<double> value;
+};
+
 [[nodiscard]] double conservative_absolute_error(
     double candidate, const Interval& enclosure);
+
+[[nodiscard]] double compute_mse_upper_bound(
+    std::span<const double> absolute_error_upper_bounds);
+
+[[nodiscard]] PsnrLowerBound compute_psnr_lower_bound(
+    double mse_upper_bound, double signal_peak);
 
 [[nodiscard]] ImageMetricBounds compute_image_metric_bounds(
     std::span<const double> absolute_error_upper_bounds,

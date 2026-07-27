@@ -1,6 +1,7 @@
 #include "lumenbound/certification/certifier.hpp"
 
 #include "lumenbound/certification/image_metrics.hpp"
+#include "lumenbound/certification/problem_digest.hpp"
 #include "lumenbound/core/backend.hpp"
 #include "lumenbound/math/interval.hpp"
 #include "lumenbound/math/rounding.hpp"
@@ -11,51 +12,67 @@
 #include <stdexcept>
 #include <utility>
 
+#ifndef LUMENBOUND_SOLVER_VERSION
+#error "LUMENBOUND_SOLVER_VERSION must be defined by the build"
+#endif
+
 namespace lumenbound {
 namespace {
 
-[[nodiscard]] CertificateStatus map_transport_status(
+[[nodiscard]] ProofFailureCode map_transport_failure(
     TransportValidationCode code) {
     switch (code) {
     case TransportValidationCode::Valid:
-        return CertificateStatus::Certified;
+        return ProofFailureCode::None;
     case TransportValidationCode::InvalidDimensions:
-        return CertificateStatus::UncertifiedInvalidDimensions;
+        return ProofFailureCode::InvalidDimensions;
     case TransportValidationCode::NonFiniteInput:
-        return CertificateStatus::UncertifiedNonFiniteInput;
+        return ProofFailureCode::NonFiniteInput;
     case TransportValidationCode::NegativeEmission:
-        return CertificateStatus::UncertifiedNegativeEmission;
+        return ProofFailureCode::NegativeEmission;
     case TransportValidationCode::NegativeTransport:
-        return CertificateStatus::UncertifiedNegativeTransport;
+        return ProofFailureCode::NegativeTransport;
     case TransportValidationCode::NonContractive:
-        return CertificateStatus::UncertifiedNonContractive;
+        return ProofFailureCode::NonContractive;
     case TransportValidationCode::NumericalFailure:
-        return CertificateStatus::NumericalFailure;
+        return ProofFailureCode::NumericalFailure;
     }
-    return CertificateStatus::NumericalFailure;
+    return ProofFailureCode::NumericalFailure;
 }
 
-[[nodiscard]] CertificateStatus map_projection_status(
+[[nodiscard]] ProofFailureCode map_projection_failure(
     ProjectionValidationCode code) {
     switch (code) {
     case ProjectionValidationCode::Valid:
-        return CertificateStatus::Certified;
+        return ProofFailureCode::None;
     case ProjectionValidationCode::InvalidDimensions:
-        return CertificateStatus::UncertifiedInvalidDimensions;
+        return ProofFailureCode::InvalidDimensions;
     case ProjectionValidationCode::NonFiniteInput:
-        return CertificateStatus::UncertifiedNonFiniteInput;
+        return ProofFailureCode::NonFiniteInput;
     case ProjectionValidationCode::NegativeProjection:
-        return CertificateStatus::UncertifiedNegativeProjection;
+        return ProofFailureCode::NegativeProjection;
     }
-    return CertificateStatus::NumericalFailure;
+    return ProofFailureCode::NumericalFailure;
 }
 
-void set_bound_status(Certificate& certificate) {
+void mark_bound_proof_status(Certificate& certificate) {
     for (BoundedValue& bound : certificate.coefficient_bounds) {
-        bound.status = certificate.status;
+        bound.proof_status = certificate.proof_status;
     }
     for (BoundedValue& bound : certificate.pixel_bounds) {
-        bound.status = certificate.status;
+        bound.proof_status = certificate.proof_status;
+    }
+}
+
+void set_proof_failure(Certificate& certificate,
+                       ProofFailureCode failure,
+                       std::string reason) {
+    certificate.proof_status = ProofStatus::Uncertified;
+    certificate.proof_failure = failure;
+    certificate.proof_reason = std::move(reason);
+    if (certificate.target_status != TargetStatus::InvalidTarget) {
+        certificate.target_status = TargetStatus::NotEvaluated;
+        certificate.target_reason = "proof_not_established";
     }
 }
 
@@ -97,6 +114,42 @@ void compute_residual_certificate(
         math::divide_up(residual_upper, denominator_lower);
 }
 
+void intersect_with_residual_enclosure(
+    const CandidateSolution& candidate, double error_upper_bound,
+    std::vector<DenseVector>& lower,
+    std::vector<DenseVector>& upper) {
+    for (std::size_t band = 0; band < lower.size(); ++band) {
+        for (std::size_t coefficient = 0;
+             coefficient < lower[band].size(); ++coefficient) {
+            const double candidate_value =
+                candidate.values.at(band)[coefficient];
+            const Interval residual_enclosure(
+                math::subtract_down(candidate_value, error_upper_bound),
+                math::add_up(candidate_value, error_upper_bound));
+            const std::optional<Interval> refined =
+                Interval(lower[band][coefficient],
+                         upper[band][coefficient])
+                    .intersection(residual_enclosure);
+            if (!refined.has_value()) {
+                throw std::runtime_error(
+                    "residual enclosure intersection is empty");
+            }
+            lower[band][coefficient] = refined->lower();
+            upper[band][coefficient] = refined->upper();
+        }
+    }
+}
+
+void retain_snapshot_if_requested(
+    const CertificationOptions& options,
+    const std::vector<DenseVector>& lower,
+    const std::vector<DenseVector>& upper,
+    CertificationResult& result) {
+    if (options.retain_iteration_snapshots) {
+        result.iterations.push_back(IterationSnapshot{lower, upper});
+    }
+}
+
 void update_bounds_and_metrics(
     const Projection& projection, const CandidateSolution& candidate,
     const std::vector<DenseVector>& lower,
@@ -119,7 +172,7 @@ void update_bounds_and_metrics(
                 BoundedValue{band, coefficient, candidate_value,
                              lower[band][coefficient],
                              upper[band][coefficient], error_bound,
-                             CertificateStatus::NumericalFailure});
+                             ProofStatus::Uncertified});
         }
     }
 
@@ -145,21 +198,28 @@ void update_bounds_and_metrics(
             certificate.pixel_bounds.push_back(
                 BoundedValue{band, pixel, candidate_value, bounds.lower(),
                              bounds.upper(), error_bound,
-                             CertificateStatus::NumericalFailure});
+                             ProofStatus::Uncertified});
             pixel_error_bounds.push_back(error_bound);
         }
     }
 
-    const ImageMetricBounds metrics =
-        compute_image_metric_bounds(pixel_error_bounds,
-                                    certificate.signal_peak);
-    certificate.mse_upper_bound = metrics.mse_upper_bound;
-    certificate.psnr_lower_bound_kind =
-        metrics.psnr_lower_bound_kind;
-    certificate.psnr_lower_bound = metrics.psnr_lower_bound;
+    certificate.mse_upper_bound =
+        compute_mse_upper_bound(pixel_error_bounds);
+    certificate.psnr_lower_bound_kind = PsnrBoundKind::Unavailable;
+    certificate.psnr_lower_bound.reset();
+    if (std::isfinite(certificate.signal_peak) &&
+        certificate.signal_peak > 0.0) {
+        const PsnrLowerBound psnr = compute_psnr_lower_bound(
+            *certificate.mse_upper_bound, certificate.signal_peak);
+        certificate.psnr_lower_bound_kind = psnr.kind;
+        certificate.psnr_lower_bound = psnr.value;
+    }
 }
 
 [[nodiscard]] bool target_is_reached(const Certificate& certificate) {
+    if (certificate.target_status == TargetStatus::InvalidTarget) {
+        return false;
+    }
     if (certificate.psnr_lower_bound_kind ==
         PsnrBoundKind::PositiveInfinity) {
         return true;
@@ -172,47 +232,68 @@ void update_bounds_and_metrics(
 [[nodiscard]] std::vector<std::string> certificate_assumptions() {
     return {
         "finite_input_values_are_interpreted_as_exact_binary64_numbers",
-        "spectral_coefficients_are_independent",
+        "coefficient_bands_are_independent_and_positionally_ordered",
+        "certification_requires_componentwise_nonnegative_emission",
         "certification_requires_finite_componentwise_nonnegative_transport_and_projection",
         "certification_requires_a_conservative_transport_infinity_norm_bound_below_one",
         "certification_requires_preserved_binary64_subnormal_values",
+        "certification_requires_source_precision_evaluation_without_operation_contraction",
         "certification_requires_fixed_order_outward_rounded_arithmetic",
+        "the_residual_enclosure_is_intersected_with_the_positive_transport_enclosure",
         "binary64_bit_strings_are_authoritative_for_reported_bounds",
         "the_projection_targets_raw_linear_coefficients",
-        "the_preview_display_mapping_is_not_certified",
+        "display_preview_conversion_is_outside_the_certificate",
     };
 }
 
 }  // namespace
 
-const char* to_string(CertificateStatus status) noexcept {
+const char* to_string(ProofStatus status) noexcept {
     switch (status) {
-    case CertificateStatus::Certified:
+    case ProofStatus::Certified:
         return "Certified";
-    case CertificateStatus::UncertifiedInvalidDimensions:
-        return "UncertifiedInvalidDimensions";
-    case CertificateStatus::UncertifiedNonFiniteInput:
-        return "UncertifiedNonFiniteInput";
-    case CertificateStatus::UncertifiedNegativeEmission:
-        return "UncertifiedNegativeEmission";
-    case CertificateStatus::UncertifiedNegativeTransport:
-        return "UncertifiedNegativeTransport";
-    case CertificateStatus::UncertifiedNegativeProjection:
-        return "UncertifiedNegativeProjection";
-    case CertificateStatus::UncertifiedNonContractive:
-        return "UncertifiedNonContractive";
-    case CertificateStatus::UncertifiedInvalidSignalPeak:
-        return "UncertifiedInvalidSignalPeak";
-    case CertificateStatus::UncertifiedInvalidTarget:
-        return "UncertifiedInvalidTarget";
-    case CertificateStatus::UncertifiedIterationLimit:
-        return "UncertifiedIterationLimit";
-    case CertificateStatus::UncertifiedTargetNotReached:
-        return "UncertifiedTargetNotReached";
-    case CertificateStatus::NumericalFailure:
+    case ProofStatus::Uncertified:
+        return "Uncertified";
+    }
+    return "Uncertified";
+}
+
+const char* to_string(ProofFailureCode code) noexcept {
+    switch (code) {
+    case ProofFailureCode::None:
+        return "None";
+    case ProofFailureCode::InvalidDimensions:
+        return "InvalidDimensions";
+    case ProofFailureCode::NonFiniteInput:
+        return "NonFiniteInput";
+    case ProofFailureCode::NegativeEmission:
+        return "NegativeEmission";
+    case ProofFailureCode::NegativeTransport:
+        return "NegativeTransport";
+    case ProofFailureCode::NegativeProjection:
+        return "NegativeProjection";
+    case ProofFailureCode::NonContractive:
+        return "NonContractive";
+    case ProofFailureCode::NumericalFailure:
         return "NumericalFailure";
     }
     return "NumericalFailure";
+}
+
+const char* to_string(TargetStatus status) noexcept {
+    switch (status) {
+    case TargetStatus::NotEvaluated:
+        return "NotEvaluated";
+    case TargetStatus::Reached:
+        return "Reached";
+    case TargetStatus::IterationLimit:
+        return "IterationLimit";
+    case TargetStatus::Stagnated:
+        return "Stagnated";
+    case TargetStatus::InvalidTarget:
+        return "InvalidTarget";
+    }
+    return "NotEvaluated";
 }
 
 CertificationResult certify(const TransportSystem& system,
@@ -220,6 +301,7 @@ CertificationResult certify(const TransportSystem& system,
                             const CertificationOptions& options) {
     CertificationResult result;
     Certificate& certificate = result.certificate;
+    certificate.solver_version = LUMENBOUND_SOLVER_VERSION;
     certificate.spectral_coefficient_count =
         system.spectral_coefficient_count();
     certificate.transport_coefficient_count =
@@ -227,7 +309,30 @@ CertificationResult certify(const TransportSystem& system,
     certificate.pixel_count = projection.pixel_count();
     certificate.signal_peak = options.signal_peak;
     certificate.target_psnr = options.target_psnr;
+    certificate.maximum_iterations = options.maximum_iterations;
+    certificate.iteration_snapshots_retained =
+        options.retain_iteration_snapshots;
     certificate.assumptions = certificate_assumptions();
+
+    if (!std::isfinite(options.signal_peak) ||
+        options.signal_peak <= 0.0) {
+        certificate.target_status = TargetStatus::InvalidTarget;
+        certificate.target_reason =
+            "signal_peak_must_be_finite_and_positive";
+    } else if (!std::isfinite(options.target_psnr)) {
+        certificate.target_status = TargetStatus::InvalidTarget;
+        certificate.target_reason = "target_psnr_must_be_finite";
+    }
+
+    try {
+        certificate.problem_digest =
+            compute_problem_digest(system, projection, options);
+    } catch (const std::exception&) {
+        set_proof_failure(certificate,
+                          ProofFailureCode::NumericalFailure,
+                          "problem_digest_evaluation_failed");
+        return result;
+    }
 
     const TransportValidationReport system_validation = system.validate();
     if (system_validation.valid() ||
@@ -237,30 +342,18 @@ CertificationResult certify(const TransportSystem& system,
             system_validation.contraction_upper_bound;
     }
     if (!system_validation.valid()) {
-        certificate.status = map_transport_status(system_validation.code);
-        certificate.reason = system_validation.reason;
+        set_proof_failure(
+            certificate, map_transport_failure(system_validation.code),
+            system_validation.reason);
         return result;
     }
 
     const ProjectionValidationReport projection_validation =
         projection.validate(system.transport_coefficient_count());
     if (!projection_validation.valid()) {
-        certificate.status =
-            map_projection_status(projection_validation.code);
-        certificate.reason = projection_validation.reason;
-        return result;
-    }
-
-    if (!std::isfinite(options.signal_peak) ||
-        options.signal_peak <= 0.0) {
-        certificate.status =
-            CertificateStatus::UncertifiedInvalidSignalPeak;
-        certificate.reason = "signal_peak_must_be_finite_and_positive";
-        return result;
-    }
-    if (!std::isfinite(options.target_psnr)) {
-        certificate.status = CertificateStatus::UncertifiedInvalidTarget;
-        certificate.reason = "target_psnr_must_be_finite";
+        set_proof_failure(
+            certificate, map_projection_failure(projection_validation.code),
+            projection_validation.reason);
         return result;
     }
 
@@ -270,24 +363,24 @@ CertificationResult certify(const TransportSystem& system,
             math::subtract_down(
                 1.0, *certificate.contraction_upper_bound);
     } catch (const std::exception&) {
-        certificate.status = CertificateStatus::NumericalFailure;
-        certificate.reason =
-            "contraction_denominator_evaluation_failed";
+        set_proof_failure(
+            certificate, ProofFailureCode::NumericalFailure,
+            "contraction_denominator_evaluation_failed");
         return result;
     }
     if (denominator_lower <= 0.0) {
-        certificate.status =
-            CertificateStatus::UncertifiedNonContractive;
-        certificate.reason =
-            "rounded_contraction_denominator_is_not_positive";
+        set_proof_failure(
+            certificate, ProofFailureCode::NonContractive,
+            "rounded_contraction_denominator_is_not_positive");
         return result;
     }
 
     try {
         result.candidate = solve_candidate(system);
     } catch (const std::exception&) {
-        certificate.status = CertificateStatus::NumericalFailure;
-        certificate.reason = "candidate_dense_solve_failed";
+        set_proof_failure(certificate,
+                          ProofFailureCode::NumericalFailure,
+                          "candidate_dense_solve_failed");
         return result;
     }
 
@@ -317,30 +410,43 @@ CertificationResult certify(const TransportSystem& system,
                                uniform_upper);
         }
 
-        result.iterations.push_back(IterationSnapshot{lower, upper});
+        arithmetic_failure_reason =
+            "residual_enclosure_intersection_failed";
+        intersect_with_residual_enclosure(
+            result.candidate,
+            *certificate.candidate_error_upper_bound, lower, upper);
+        retain_snapshot_if_requested(options, lower, upper, result);
+
         arithmetic_failure_reason =
             "image_bound_evaluation_failed";
         update_bounds_and_metrics(projection, result.candidate, lower, upper,
                                   certificate);
+        certificate.proof_status = ProofStatus::Certified;
+        certificate.proof_failure = ProofFailureCode::None;
+        certificate.proof_reason = "all_proof_obligations_satisfied";
+        mark_bound_proof_status(certificate);
+
+        if (certificate.target_status == TargetStatus::InvalidTarget) {
+            return result;
+        }
         if (target_is_reached(certificate)) {
-            certificate.status = CertificateStatus::Certified;
-            certificate.reason =
+            certificate.target_status = TargetStatus::Reached;
+            certificate.target_reason =
                 "requested_psnr_lower_bound_reached";
-            set_bound_status(certificate);
             return result;
         }
 
         if (options.maximum_iterations == 0) {
-            certificate.status =
-                CertificateStatus::UncertifiedIterationLimit;
-            certificate.reason =
+            certificate.target_status = TargetStatus::IterationLimit;
+            certificate.target_reason =
                 "zero_iteration_budget_before_target";
-            set_bound_status(certificate);
             return result;
         }
 
-        for (std::size_t iteration = 1;
-             iteration <= options.maximum_iterations; ++iteration) {
+        for (std::size_t iteration_index = 0;
+             iteration_index < options.maximum_iterations;
+             ++iteration_index) {
+            const std::size_t iteration = iteration_index + 1U;
             arithmetic_failure_reason =
                 "interval_propagation_failed";
             std::vector<DenseVector> next_lower;
@@ -402,41 +508,46 @@ CertificationResult certify(const TransportSystem& system,
 
             lower = std::move(next_lower);
             upper = std::move(next_upper);
-            result.iterations.push_back(
-                IterationSnapshot{lower, upper});
+            retain_snapshot_if_requested(options, lower, upper, result);
             certificate.interval_iteration_count = iteration;
             arithmetic_failure_reason =
                 "image_bound_evaluation_failed";
             update_bounds_and_metrics(projection, result.candidate, lower,
                                       upper, certificate);
+            mark_bound_proof_status(certificate);
 
             if (target_is_reached(certificate)) {
-                certificate.status = CertificateStatus::Certified;
-                certificate.reason =
+                certificate.target_status = TargetStatus::Reached;
+                certificate.target_reason =
                     "requested_psnr_lower_bound_reached";
-                set_bound_status(certificate);
                 return result;
             }
 
             if (!changed) {
-                certificate.status =
-                    CertificateStatus::UncertifiedTargetNotReached;
-                certificate.reason =
+                certificate.target_status = TargetStatus::Stagnated;
+                certificate.target_reason =
                     "interval_propagation_stagnated_before_target";
-                set_bound_status(certificate);
+                return result;
+            }
+
+            // The last permitted iteration must return here. Incrementing a
+            // size_t counter at its maximum would restart the loop at zero.
+            if (iteration == options.maximum_iterations) {
+                certificate.target_status = TargetStatus::IterationLimit;
+                certificate.target_reason =
+                    "maximum_interval_iterations_exhausted_before_target";
                 return result;
             }
         }
 
-        certificate.status =
-            CertificateStatus::UncertifiedIterationLimit;
-        certificate.reason =
+        certificate.target_status = TargetStatus::IterationLimit;
+        certificate.target_reason =
             "maximum_interval_iterations_exhausted_before_target";
-        set_bound_status(certificate);
         return result;
     } catch (const std::exception&) {
-        certificate.status = CertificateStatus::NumericalFailure;
-        certificate.reason = arithmetic_failure_reason;
+        set_proof_failure(certificate,
+                          ProofFailureCode::NumericalFailure,
+                          arithmetic_failure_reason);
         certificate.coefficient_bounds.clear();
         certificate.pixel_bounds.clear();
         certificate.residual_upper_bound.reset();
@@ -444,6 +555,7 @@ CertificationResult certify(const TransportSystem& system,
         certificate.mse_upper_bound.reset();
         certificate.psnr_lower_bound_kind = PsnrBoundKind::Unavailable;
         certificate.psnr_lower_bound.reset();
+        result.iterations.clear();
         return result;
     }
 }

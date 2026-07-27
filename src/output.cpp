@@ -155,7 +155,8 @@ void append_bounded_values(std::ostringstream& stream,
         const BoundedValue& value = values[value_index];
         stream << "\n    {\"band\":" << value.band
                << ",\"index\":" << value.index
-               << ",\"status\":\"" << to_string(value.status)
+               << ",\"proof_status\":\""
+               << to_string(value.proof_status)
                << "\",\"candidate\":";
         append_scalar(stream, value.candidate);
         stream << ",\"lower\":";
@@ -255,11 +256,11 @@ void write_text(const std::filesystem::path& path,
     std::ostringstream stream;
     stream.imbue(std::locale::classic());
     stream
-        << "band,coefficient,status,candidate,lower,upper,"
+        << "band,coefficient,proof_status,candidate,lower,upper,"
            "absolute_error_upper_bound\n";
     for (const BoundedValue& value : certificate.coefficient_bounds) {
         stream << value.band << ',' << value.index << ','
-               << to_string(value.status) << ','
+               << to_string(value.proof_status) << ','
                << decimal_string(value.candidate) << ','
                << decimal_string(value.lower) << ','
                << decimal_string(value.upper) << ','
@@ -272,11 +273,11 @@ void write_text(const std::filesystem::path& path,
     std::ostringstream stream;
     stream.imbue(std::locale::classic());
     stream
-        << "pixel,band,status,candidate,lower,upper,"
+        << "pixel,band,proof_status,candidate,lower,upper,"
            "absolute_error_upper_bound\n";
     for (const BoundedValue& value : certificate.pixel_bounds) {
         stream << value.index << ',' << value.band << ','
-               << to_string(value.status) << ','
+               << to_string(value.proof_status) << ','
                << decimal_string(value.candidate) << ','
                << decimal_string(value.lower) << ','
                << decimal_string(value.upper) << ','
@@ -285,14 +286,71 @@ void write_text(const std::filesystem::path& path,
     return stream.str();
 }
 
-[[nodiscard]] int preview_channel(double value, double signal_peak) {
+[[nodiscard]] int false_color_preview_channel(double value,
+                                              double signal_peak) {
     const double normalized = std::clamp(value / signal_peak, 0.0, 1.0);
     return static_cast<int>(std::lround(normalized * 255.0));
 }
 
+[[nodiscard]] double srgb_oetf(double linear_value) {
+    constexpr double linear_threshold = 0.0031308;
+    if (linear_value <= linear_threshold) {
+        return 12.92 * linear_value;
+    }
+    return (1.055 * std::pow(linear_value, 1.0 / 2.4)) - 0.055;
+}
+
+[[nodiscard]] int declared_linear_srgb_preview_channel(
+    double value, double exposure) {
+    const double linear_value =
+        std::clamp(value * exposure, 0.0, 1.0);
+    const double encoded_value = srgb_oetf(linear_value);
+    return static_cast<int>(std::lround(encoded_value * 255.0));
+}
+
+void validate_preview_settings(const PreviewSettings& settings) {
+    if (!std::isfinite(settings.exposure) || settings.exposure <= 0.0) {
+        throw std::invalid_argument(
+            "preview exposure must be finite and positive");
+    }
+    switch (settings.mapping) {
+    case PreviewMapping::FalseColorCoefficientClamp:
+    case PreviewMapping::DeclaredLinearSrgb:
+        return;
+    }
+    throw std::invalid_argument("preview mapping is invalid");
+}
+
+constexpr std::array<std::string_view, 7> demo_output_names{
+    "candidate-coefficients.csv",
+    "coefficient-bounds.csv",
+    "linear-pixels.csv",
+    "preview.ppm",
+    "metrics.json",
+    "certificate.json",
+    "assembly.json",
+};
+
+void prepare_output_directory(
+    const std::filesystem::path& output_directory) {
+    std::filesystem::create_directories(output_directory);
+    if (!std::filesystem::is_directory(output_directory)) {
+        throw std::runtime_error("output path is not a directory");
+    }
+
+    for (const std::string_view name : demo_output_names) {
+        const std::filesystem::path path = output_directory / name;
+        remove_file_if_present(path);
+        std::filesystem::path temporary_path = path;
+        temporary_path += ".tmp";
+        remove_file_if_present(temporary_path);
+    }
+}
+
 [[nodiscard]] std::string preview_ppm(const Certificate& certificate,
                                       std::size_t width,
-                                      std::size_t height) {
+                                      std::size_t height,
+                                      const PreviewSettings& settings) {
     if (width == 0 || height == 0 ||
         width > (std::numeric_limits<std::size_t>::max() / height) ||
         (width * height) != certificate.pixel_count ||
@@ -301,29 +359,103 @@ void write_text(const std::filesystem::path& path,
             "preview dimensions or band count are invalid");
     }
 
+    if (certificate.spectral_coefficient_count >
+        (std::numeric_limits<std::size_t>::max() /
+         certificate.pixel_count) ||
+        certificate.pixel_bounds.size() !=
+            certificate.spectral_coefficient_count *
+                certificate.pixel_count) {
+        throw std::invalid_argument(
+            "preview pixel bounds are not a complete band-major array");
+    }
+
     std::ostringstream stream;
     stream.imbue(std::locale::classic());
-    stream << "P3\n"
-           << "# Non-certifying linear clamp preview\n"
-           << width << ' ' << height << "\n255\n";
+    stream << "P3\n";
+    switch (settings.mapping) {
+    case PreviewMapping::FalseColorCoefficientClamp:
+        stream << "# False-color coefficient preview; not certified\n";
+        break;
+    case PreviewMapping::DeclaredLinearSrgb:
+        stream
+            << "# Declared linear-sRGB preview; non-certifying\n"
+            << "# Mapping: exposure "
+            << decimal_string(settings.exposure)
+            << ", clamp [0,1], sRGB OETF, 8-bit quantization\n";
+        break;
+    }
+    stream << width << ' ' << height << "\n255\n";
 
     for (std::size_t pixel = 0; pixel < certificate.pixel_count;
          ++pixel) {
         int channels[3]{};
         for (std::size_t band = 0; band < 3; ++band) {
-            const auto found = std::find_if(
-                certificate.pixel_bounds.begin(),
-                certificate.pixel_bounds.end(),
-                [band, pixel](const BoundedValue& value) {
-                    return value.band == band && value.index == pixel;
-                });
-            if (found == certificate.pixel_bounds.end()) {
+            const BoundedValue& value =
+                certificate.pixel_bounds[
+                    (band * certificate.pixel_count) + pixel];
+            if (value.band != band || value.index != pixel) {
                 throw std::runtime_error(
-                    "preview pixel coefficient is missing");
+                    "preview pixel bounds are not in band-major order");
             }
-            channels[band] =
-                preview_channel(found->candidate,
-                                certificate.signal_peak);
+            if (!std::isfinite(value.candidate)) {
+                throw std::runtime_error(
+                    "preview candidate coefficient is non-finite");
+            }
+            switch (settings.mapping) {
+            case PreviewMapping::FalseColorCoefficientClamp:
+                channels[band] = false_color_preview_channel(
+                    value.candidate, certificate.signal_peak);
+                break;
+            case PreviewMapping::DeclaredLinearSrgb:
+                channels[band] =
+                    declared_linear_srgb_preview_channel(
+                        value.candidate, settings.exposure);
+                break;
+            }
+        }
+        stream << channels[0] << ' ' << channels[1] << ' '
+               << channels[2] << '\n';
+    }
+    return stream.str();
+}
+
+[[nodiscard]] std::string preview_only_ppm(
+    const std::vector<DenseVector>& pixel_bands,
+    std::size_t width, std::size_t height, double exposure) {
+    if (width == 0 || height == 0 ||
+        width > (std::numeric_limits<std::size_t>::max() / height)) {
+        throw std::invalid_argument("preview dimensions are invalid");
+    }
+    const std::size_t pixel_count = width * height;
+    if (pixel_bands.size() < 3) {
+        throw std::invalid_argument(
+            "preview requires at least three coefficient bands");
+    }
+    for (const DenseVector& band : pixel_bands) {
+        if (band.size() != pixel_count || !band.is_finite()) {
+            throw std::invalid_argument(
+                "preview bands must be finite and match the image size");
+        }
+    }
+
+    validate_preview_settings(
+        PreviewSettings{PreviewMapping::DeclaredLinearSrgb, exposure});
+
+    std::ostringstream stream;
+    stream.imbue(std::locale::classic());
+    stream
+        << "P3\n"
+        << "# Preview-only candidate render; no certificate generated\n"
+        << "# Declared linear-sRGB preview; non-certifying\n"
+        << "# Mapping: exposure " << decimal_string(exposure)
+        << ", clamp [0,1], sRGB OETF, 8-bit quantization\n"
+        << width << ' ' << height << "\n255\n";
+
+    for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+        int channels[3]{};
+        for (std::size_t band = 0; band < 3; ++band) {
+            channels[band] = declared_linear_srgb_preview_channel(
+                pixel_bands[band][pixel], exposure);
         }
         stream << channels[0] << ' ' << channels[1] << ' '
                << channels[2] << '\n';
@@ -339,15 +471,40 @@ std::string certificate_to_json(const Certificate& certificate) {
     stream << "{\n"
            << "  \"schema_version\":\""
            << json_escape(certificate.schema_version) << "\",\n"
-           << "  \"status\":\"" << to_string(certificate.status)
+           << "  \"certificate_scope\":\""
+           << json_escape(certificate.certificate_scope) << "\",\n"
+           << "  \"problem_digest\":";
+    if (certificate.problem_digest.empty()) {
+        stream << "null";
+    } else {
+        stream << '"' << json_escape(certificate.problem_digest) << '"';
+    }
+    stream << ",\n"
+           << "  \"solver_version\":\""
+           << json_escape(certificate.solver_version) << "\",\n"
+           << "  \"arithmetic_policy\":\""
+           << json_escape(certificate.arithmetic_policy) << "\",\n"
+           << "  \"proof_status\":\""
+           << to_string(certificate.proof_status)
            << "\",\n"
-           << "  \"reason\":\""
-           << json_escape(certificate.reason) << "\",\n"
+           << "  \"proof_failure\":\""
+           << to_string(certificate.proof_failure) << "\",\n"
+           << "  \"proof_reason\":\""
+           << json_escape(certificate.proof_reason) << "\",\n"
+           << "  \"target_status\":\""
+           << to_string(certificate.target_status) << "\",\n"
+           << "  \"target_reason\":\""
+           << json_escape(certificate.target_reason) << "\",\n"
            << "  \"dimensions\":{\"spectral_coefficients\":"
            << certificate.spectral_coefficient_count
            << ",\"transport_coefficients\":"
            << certificate.transport_coefficient_count
            << ",\"pixels\":" << certificate.pixel_count << "},\n"
+           << "  \"options\":{\"maximum_iterations\":"
+           << certificate.maximum_iterations
+           << ",\"retain_iteration_snapshots\":"
+           << (certificate.iteration_snapshots_retained ? "true" : "false")
+           << "},\n"
            << "  \"assumptions\":[";
     for (std::size_t assumption_index = 0;
          assumption_index < certificate.assumptions.size();
@@ -404,11 +561,31 @@ std::string metrics_to_json(const Certificate& certificate) {
     std::ostringstream stream;
     stream.imbue(std::locale::classic());
     stream << "{\n"
-           << "  \"schema_version\":\"lumenbound.metrics.v1\",\n"
-           << "  \"status\":\"" << to_string(certificate.status)
+           << "  \"schema_version\":\"lumenbound.metrics.v2\",\n"
+           << "  \"certificate_scope\":\""
+           << json_escape(certificate.certificate_scope) << "\",\n"
+           << "  \"problem_digest\":";
+    if (certificate.problem_digest.empty()) {
+        stream << "null";
+    } else {
+        stream << '"' << json_escape(certificate.problem_digest) << '"';
+    }
+    stream << ",\n"
+           << "  \"solver_version\":\""
+           << json_escape(certificate.solver_version) << "\",\n"
+           << "  \"arithmetic_policy\":\""
+           << json_escape(certificate.arithmetic_policy) << "\",\n"
+           << "  \"proof_status\":\""
+           << to_string(certificate.proof_status)
            << "\",\n"
-           << "  \"reason\":\""
-           << json_escape(certificate.reason) << "\",\n"
+           << "  \"proof_failure\":\""
+           << to_string(certificate.proof_failure) << "\",\n"
+           << "  \"proof_reason\":\""
+           << json_escape(certificate.proof_reason) << "\",\n"
+           << "  \"target_status\":\""
+           << to_string(certificate.target_status) << "\",\n"
+           << "  \"target_reason\":\""
+           << json_escape(certificate.target_reason) << "\",\n"
            << "  \"contraction_upper_bound\":";
     append_optional_scalar(stream,
                            certificate.contraction_upper_bound);
@@ -437,7 +614,10 @@ std::string metrics_to_json(const Certificate& certificate) {
 void write_demo_outputs(const std::filesystem::path& output_directory,
                         const CertificationResult& result,
                         std::size_t image_width,
-                        std::size_t image_height) {
+                        std::size_t image_height,
+                        PreviewSettings preview_settings) {
+    validate_preview_settings(preview_settings);
+
     const std::string certificate_json =
         certificate_to_json(result.certificate);
     const std::string metrics_json =
@@ -451,8 +631,10 @@ void write_demo_outputs(const std::filesystem::path& output_directory,
     const bool can_write_preview =
         has_pixel_bounds &&
         result.certificate.spectral_coefficient_count >= 3 &&
-        std::isfinite(result.certificate.signal_peak) &&
-        result.certificate.signal_peak > 0.0;
+        (preview_settings.mapping ==
+             PreviewMapping::DeclaredLinearSrgb ||
+         (std::isfinite(result.certificate.signal_peak) &&
+          result.certificate.signal_peak > 0.0));
 
     std::string candidate_data;
     std::string coefficient_data;
@@ -470,37 +652,18 @@ void write_demo_outputs(const std::filesystem::path& output_directory,
     }
     if (can_write_preview) {
         preview_data = preview_ppm(
-            result.certificate, image_width, image_height);
+            result.certificate, image_width, image_height,
+            preview_settings);
     }
 
-    if (result.certificate.status == CertificateStatus::Certified &&
+    if (result.certificate.proof_status == ProofStatus::Certified &&
         (!has_candidate || !has_coefficient_bounds ||
-         !has_pixel_bounds || !can_write_preview)) {
+         !has_pixel_bounds)) {
         throw std::runtime_error(
             "certified demonstration output is incomplete");
     }
 
-    std::filesystem::create_directories(output_directory);
-    if (!std::filesystem::is_directory(output_directory)) {
-        throw std::runtime_error(
-            "output path is not a directory");
-    }
-
-    constexpr std::array<std::string_view, 6> output_names{
-        "candidate-coefficients.csv",
-        "coefficient-bounds.csv",
-        "linear-pixels.csv",
-        "preview.ppm",
-        "metrics.json",
-        "certificate.json",
-    };
-    for (const std::string_view name : output_names) {
-        const std::filesystem::path path = output_directory / name;
-        remove_file_if_present(path);
-        std::filesystem::path temporary_path = path;
-        temporary_path += ".tmp";
-        remove_file_if_present(temporary_path);
-    }
+    prepare_output_directory(output_directory);
 
     if (has_candidate) {
         write_text(output_directory / "candidate-coefficients.csv",
@@ -520,6 +683,17 @@ void write_demo_outputs(const std::filesystem::path& output_directory,
     write_text(output_directory / "metrics.json", metrics_json);
     write_text(output_directory / "certificate.json",
                certificate_json);
+}
+
+void write_preview_only_output(
+    const std::filesystem::path& output_directory,
+    const std::vector<DenseVector>& pixel_bands,
+    std::size_t image_width, std::size_t image_height,
+    double exposure) {
+    const std::string preview_data = preview_only_ppm(
+        pixel_bands, image_width, image_height, exposure);
+    prepare_output_directory(output_directory);
+    write_text(output_directory / "preview.ppm", preview_data);
 }
 
 }  // namespace lumenbound

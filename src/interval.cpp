@@ -3,14 +3,25 @@
 #include "lumenbound/math/rounding.hpp"
 
 #include <algorithm>
+#include <cfloat>
 #include <cfenv>
 #include <cmath>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 
+#if defined(__FAST_MATH__) || defined(_M_FP_FAST)
+#error "Certified arithmetic cannot be compiled with fast-math semantics"
+#endif
+
+static_assert(
+    FLT_EVAL_METHOD == 0,
+    "Certified arithmetic requires source-precision evaluation");
+
 #if defined(_MSC_VER)
 #pragma fenv_access(on)
+#elif defined(__clang__)
+#pragma STDC FENV_ACCESS ON
 #endif
 
 namespace lumenbound::math {
